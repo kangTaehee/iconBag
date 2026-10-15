@@ -1,21 +1,16 @@
-// 바탕화면(explorer) 연동: 창 탐색, 파일 스캔, 재검색, 아이콘 숨김
+// 바탕화면(explorer) 연동: 창 탐색, 파일 스캔, 재검색(규칙 분류), 아이콘 숨김, 자동 정리
 #![allow(unused_imports, dead_code)]
 use crate::*;
 use core::ffi::c_void;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-
 use windows_sys::core::PWSTR;
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
-use windows_sys::Win32::System::Registry::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// ───────────────────────── 바탕화면 탐색 ─────────────────────────
 pub unsafe fn find_desktop() -> (HWND, HWND) {
     let progman = FindWindowW(wide("Progman").as_ptr(), null());
     let mut dv = if progman.is_null() {
@@ -55,26 +50,74 @@ pub unsafe fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-pub fn scan_desktop(dirs: &[PathBuf]) -> Vec<PathBuf> {
+// 폴더 내용(숨김 파일·desktop.ini 제외). 포털에서도 사용.
+pub fn scan_dir(d: &Path) -> Vec<PathBuf> {
     use std::os::windows::fs::MetadataExt;
     let mut out = Vec::new();
-    for d in dirs {
-        let Ok(rd) = std::fs::read_dir(d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.eq_ignore_ascii_case("desktop.ini") {
+    let Ok(rd) = std::fs::read_dir(d) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.eq_ignore_ascii_case("desktop.ini") {
+            continue;
+        }
+        if let Ok(md) = e.metadata() {
+            if md.file_attributes() & 0x2 != 0 {
                 continue;
             }
-            if let Ok(md) = e.metadata() {
-                if md.file_attributes() & 0x2 != 0 {
-                    continue; // 숨김 파일
-                }
-            }
-            out.push(p);
         }
+        out.push(p);
     }
     out
+}
+
+pub fn scan_desktop(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter().flat_map(|d| scan_dir(d)).collect()
+}
+
+pub fn class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    from_wide(&buf[..n as usize])
+}
+
+pub fn is_desktop_root(hwnd: HWND) -> bool {
+    if hwnd.is_null() {
+        return false;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    let cls = class_name(root);
+    cls == "Progman" || cls == "WorkerW"
+}
+
+// 화면 좌표가 Fence 가 아닌 바탕화면(Progman/WorkerW) 위인지
+pub unsafe fn is_empty_desktop(pt: POINT) -> bool {
+    let target = WindowFromPoint(pt);
+    if target.is_null() || fence_idx(target).is_some() {
+        return false;
+    }
+    is_desktop_root(target)
+}
+
+pub fn desktop_is_foreground() -> bool {
+    let fg = unsafe { GetForegroundWindow() };
+    is_desktop_root(fg)
+}
+
+// 제목으로 Fence 찾기, 없으면 화면 우측 상단에 생성
+pub unsafe fn fence_by_title_or_create(title: &str) -> usize {
+    let a = app();
+    if let Some(i) = a.fences.iter().position(|f| f.title == title && f.portal.is_none()) {
+        return i;
+    }
+    let sw = GetSystemMetrics(SM_CXSCREEN);
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let n = a.fences.len() as i32;
+    let (fw, fh) = (m(330), m(300));
+    let y = (m(20) + (n % 3) * (fh + m(16))).min(sh - fh);
+    let x = (sw - m(350) - (n / 3) * (fw + m(16))).max(0);
+    let color = COLORS[(n as usize) % COLORS.len()].1;
+    new_fence(title, x, y, fw, fh, color)
 }
 
 // ───────────────────────── 바탕화면 재검색 ─────────────────────────
@@ -84,43 +127,62 @@ pub unsafe fn rescan() {
     if !a.defview.is_null() && IsWindow(a.defview) == 0 {
         reattach();
     }
+    // 포털은 자기 폴더만 갱신
+    for i in 0..a.fences.len() {
+        if a.fences[i].portal.is_some() {
+            refresh_portal(i);
+        }
+    }
     let current = scan_desktop(&a.desktop_dirs);
     let set: HashSet<String> = current.iter().map(|p| lower(&p.to_string_lossy())).collect();
     let mut changed = false;
-    for f in a.fences.iter_mut() {
+    for f in a.fences.iter_mut().filter(|f| f.portal.is_none()) {
         let before = f.items.len();
         f.items.retain(|it| set.contains(&lower(&it.path)));
         if f.items.len() != before {
-            f.sel = None;
+            f.sel.clear();
             f.clamp_scroll();
             InvalidateRect(f.hwnd, null(), 1);
             changed = true;
         }
     }
-    let assigned: HashSet<String> =
-        a.fences.iter().flat_map(|f| f.items.iter().map(|i| lower(&i.path))).collect();
-    let new: Vec<String> = current
+    let assigned: HashSet<String> = a
+        .fences
         .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| !assigned.contains(&lower(p)))
+        .filter(|f| f.portal.is_none())
+        .flat_map(|f| f.items.iter().map(|i| lower(&i.path)))
         .collect();
-    if !new.is_empty() {
-        let idx = match a.fences.iter().position(|f| f.title == NEW_ITEMS_TITLE) {
-            Some(i) => i,
-            None => {
-                let sw = GetSystemMetrics(SM_CXSCREEN);
-                new_fence(NEW_ITEMS_TITLE, sw - m(350), m(20), m(330), m(300), COLORS[0].1)
-            }
-        };
-        for p in new {
-            app().fences[idx].items.push(Item::new(&p));
-        }
+    let new: Vec<PathBuf> = current.into_iter().filter(|p| !assigned.contains(&lower(&p.to_string_lossy()))).collect();
+    for p in new {
+        let title = rule_target(&p).unwrap_or_else(|| NEW_ITEMS_TITLE.to_string());
+        let idx = fence_by_title_or_create(&title);
+        app().fences[idx].items.push(Item::new(&p.to_string_lossy()));
         invalidate(idx);
         changed = true;
     }
     if changed {
         save();
     }
+}
+
+// 모든(포털 제외) 항목을 규칙대로 다시 배치
+pub unsafe fn reapply_rules() {
+    let a = app();
+    let mut all: Vec<String> = Vec::new();
+    for f in a.fences.iter_mut().filter(|f| f.portal.is_none()) {
+        all.extend(f.items.drain(..).map(|i| i.path.clone()));
+        f.sel.clear();
+    }
+    for p in all {
+        let path = PathBuf::from(&p);
+        let title = rule_target(&path).unwrap_or_else(|| NEW_ITEMS_TITLE.to_string());
+        let idx = fence_by_title_or_create(&title);
+        app().fences[idx].items.push(Item::new(&p));
+    }
+    for i in 0..app().fences.len() {
+        invalidate(i);
+    }
+    save();
 }
 
 pub unsafe fn reattach() {
@@ -155,25 +217,35 @@ pub unsafe fn apply_icons_hidden() {
     }
 }
 
+pub fn seed_default_rules() {
+    app().rules = vec![
+        Rule { pattern: "<dir>".into(), target: "폴더".into() },
+        Rule { pattern: "*.lnk;*.exe;*.url;*.appref-ms".into(), target: "프로그램".into() },
+        Rule { pattern: "*".into(), target: "문서 및 파일".into() },
+    ];
+}
+
+// 최초 실행/트레이 메뉴: 폴더·프로그램·문서로 나누고 기본 규칙 등록
 pub unsafe fn auto_sort() {
     let a = app();
-    while !a.fences.is_empty() {
-        delete_fence(0);
-    }
-    let files = scan_desktop(&a.desktop_dirs);
-    let mut groups: [Vec<String>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for p in files {
-        let ext = p.extension().and_then(|e| e.to_str()).map(lower).unwrap_or_default();
-        let g = if p.is_dir() {
-            0
-        } else if matches!(ext.as_str(), "lnk" | "exe" | "url" | "appref-ms") {
-            1
+    // 포털은 유지, 일반 Fence 만 제거
+    let mut i = 0;
+    while i < a.fences.len() {
+        if a.fences[i].portal.is_none() {
+            delete_fence(i);
         } else {
-            2
-        };
+            i += 1;
+        }
+    }
+    seed_default_rules();
+    let files = scan_desktop(&a.desktop_dirs);
+    let titles = ["폴더", "프로그램", "문서 및 파일"];
+    let mut groups: Vec<Vec<String>> = vec![Vec::new(); 3];
+    for p in files {
+        let t = rule_target(&p).unwrap_or_default();
+        let g = titles.iter().position(|x| *x == t).unwrap_or(2);
         groups[g].push(p.to_string_lossy().to_string());
     }
-    let titles = ["폴더", "프로그램", "문서 및 파일"];
     let (fw, fh, gap) = (m(330), m(300), m(16));
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let (mut x, mut y) = (m(20), m(20));
@@ -195,15 +267,19 @@ pub unsafe fn auto_sort() {
     save();
 }
 
-// 화면 좌표가 Fence 가 아닌 바탕화면(Progman/WorkerW) 위인지
-pub unsafe fn is_empty_desktop(pt: POINT) -> bool {
-    let target = WindowFromPoint(pt);
-    if target.is_null() || fence_idx(target).is_some() {
-        return false;
+// 화면 밖으로 나간 Fence 를 가상 화면 안으로 당긴다 (해상도 변경 대응)
+pub unsafe fn clamp_fences_to_screen() {
+    let a = app();
+    let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+    let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+    for i in 0..a.fences.len() {
+        let f = &mut a.fences[i];
+        let nx = f.x.clamp(vx, (vx + vw - f.w).max(vx));
+        let ny = f.y.clamp(vy, (vy + vh - m(TITLE_H)).max(vy));
+        if nx != f.x || ny != f.y {
+            f.x = nx;
+            f.y = ny;
+            SetWindowPos(f.hwnd, null_mut(), nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
     }
-    let root = GetAncestor(target, GA_ROOT);
-    let mut buf = [0u16; 64];
-    let n = GetClassNameW(root, buf.as_mut_ptr(), buf.len() as i32);
-    let cls = from_wide(&buf[..n as usize]);
-    cls == "Progman" || cls == "WorkerW"
 }
