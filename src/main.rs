@@ -439,6 +439,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     DefWindowProcW(hwnd, msg, wp, lp)
 }
 
+// 외부 의존성 없이 현재 시각을 ISO 비슷하게 기록
+fn chrono_now() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("unix={}", secs)
+}
+
 // ───────────────────────── 진입점 ─────────────────────────
 unsafe fn register(class: &str, proc: WNDPROC, style: u32, hinst: HINSTANCE) {
     let name = wide(class);
@@ -524,6 +530,24 @@ fn main() {
             last_res: (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
         });
         APP = Box::into_raw(app_box);
+
+        // 패닉 시(panic=abort 라도 훅은 먼저 실행됨) 바탕화면 아이콘을 복원하고 원인을 기록한다
+        std::panic::set_hook(Box::new(|info| {
+            let a = app();
+            if !a.listview.is_null() {
+                ShowWindowAsync(a.listview, SW_SHOW);
+            }
+            let msg = format!("{}
+{}
+
+", chrono_now(), info);
+            let p = config_dir().join("crash.log");
+            let _ = std::fs::create_dir_all(config_dir());
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                use std::io::Write;
+                let _ = f.write_all(msg.as_bytes());
+            }
+        }));
 
         register(CLASS_MAIN, Some(main_proc), 0, hinst);
         register(CLASS_FENCE, Some(fence_proc), CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW, hinst);
