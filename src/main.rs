@@ -1,4 +1,4 @@
-// fences6 — Fences 스타일의 가벼운 바탕화면 아이콘 정리 도구 (Win32 API 직접 호출, 런타임 없음)
+// icondocs(아이콘독스) — Fences 스타일의 가벼운 바탕화면 아이콘 정리 도구 (Win32 API 직접 호출, 런타임 없음)
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case, static_mut_refs, clippy::missing_safety_doc)]
 
@@ -19,9 +19,9 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 // ───────────────────────── 상수 ─────────────────────────
-const CLASS_FENCE: &str = "Fences6Fence";
-const CLASS_MAIN: &str = "Fences6Main";
-const CLASS_RENAME: &str = "Fences6Rename";
+const CLASS_FENCE: &str = "IconDocsFence";
+const CLASS_MAIN: &str = "IconDocsMain";
+const CLASS_RENAME: &str = "IconDocsRename";
 const NEW_ITEMS_TITLE: &str = "새 항목";
 
 const TITLE_H: i32 = 30;
@@ -38,7 +38,7 @@ const WM_DESKTOP_DBLCLK: u32 = WM_APP + 2;
 const WM_BAND_DOWN: u32 = WM_APP + 4;
 const WM_BAND_MOVE: u32 = WM_APP + 5;
 const WM_BAND_UP: u32 = WM_APP + 6;
-const CLASS_BAND: &str = "Fences6Band";
+const CLASS_BAND: &str = "IconDocsBand";
 const TIMER_RESCAN: usize = 1;
 
 const ID_TRAY_NEW: usize = 101;
@@ -225,7 +225,7 @@ fn scan_desktop(dirs: &[PathBuf]) -> Vec<PathBuf> {
 
 fn config_path() -> PathBuf {
     let base = std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
-    base.join("Fences6").join("layout.txt")
+    base.join("IconDocs").join("layout.txt")
 }
 
 // ───────────────────────── 저장/불러오기 ─────────────────────────
@@ -774,7 +774,7 @@ unsafe fn toggle_fences() {
 
 // ───────────────────────── 시작 프로그램 등록 ─────────────────────────
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const RUN_VALUE: &str = "Fences6";
+const RUN_VALUE: &str = "IconDocs";
 
 unsafe fn autorun_enabled() -> bool {
     let mut hk: HKEY = null_mut();
@@ -1353,7 +1353,7 @@ fn main() {
         let main = CreateWindowExW(
             0,
             wide(CLASS_MAIN).as_ptr(),
-            wide("Fences6").as_ptr(),
+            wide("IconDocs").as_ptr(),
             WS_OVERLAPPED,
             0,
             0,
@@ -1374,7 +1374,7 @@ fn main() {
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
         nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
-        let tip = wide("Fences6 — 우클릭: 메뉴 / 더블클릭: Fence 숨기기·보이기");
+        let tip = wide("아이콘독스 — 우클릭: 메뉴 / 더블클릭: Fence 숨기기·보이기");
         nid.szTip[..tip.len().min(128)].copy_from_slice(&tip[..tip.len().min(128)]);
         Shell_NotifyIconW(NIM_ADD, &nid);
 

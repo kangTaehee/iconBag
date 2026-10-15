@@ -1,4 +1,4 @@
-# fences6
+# icondocs (아이콘독스)
 
 Stardock Fences 느낌의 가벼운 바탕화면 아이콘 정리 앱 (Windows 전용, Rust, 외부 런타임 없음).
 

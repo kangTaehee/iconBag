@@ -1,5 +1,5 @@
 [package]
-name = "fences6"
+name = "icondocs"
 version = "0.1.0"
 edition = "2021"
 description = "Lightweight Fences-style desktop icon organizer (Win32, no runtime)"
