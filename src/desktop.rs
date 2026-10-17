@@ -50,8 +50,12 @@ pub unsafe fn known_folder(id: &windows_sys::core::GUID) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-// 폴더 내용(숨김 파일·desktop.ini 제외). 포털에서도 사용.
-pub fn scan_dir(d: &Path) -> Vec<PathBuf> {
+const ATTR_HIDDEN: u32 = 0x2;
+const ATTR_SYSTEM: u32 = 0x4;
+
+// 폴더 내용과 메타데이터(desktop.ini 제외). Windows 에서 DirEntry::metadata 는 열거 결과를 재사용하므로 추가 I/O 가 없다.
+// show_hidden 이 false 면 숨김 파일을 빼고, true 여도 숨김+시스템(보호된 OS 파일)은 뺀다.
+pub fn scan_entries(d: &Path, show_hidden: bool) -> Vec<(PathBuf, std::fs::Metadata)> {
     use std::os::windows::fs::MetadataExt;
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(d) else { return out };
@@ -61,14 +65,20 @@ pub fn scan_dir(d: &Path) -> Vec<PathBuf> {
         if name.eq_ignore_ascii_case("desktop.ini") {
             continue;
         }
-        if let Ok(md) = e.metadata() {
-            if md.file_attributes() & 0x2 != 0 {
-                continue;
-            }
+        let Ok(md) = e.metadata() else { continue };
+        let attr = md.file_attributes();
+        let hidden = attr & ATTR_HIDDEN != 0;
+        if hidden && (!show_hidden || attr & ATTR_SYSTEM != 0) {
+            continue;
         }
-        out.push(p);
+        out.push((p, md));
     }
     out
+}
+
+// 폴더 내용(숨김 파일·desktop.ini 제외)
+pub fn scan_dir(d: &Path) -> Vec<PathBuf> {
+    scan_entries(d, false).into_iter().map(|(p, _)| p).collect()
 }
 
 pub fn scan_desktop(dirs: &[PathBuf]) -> Vec<PathBuf> {
@@ -161,6 +171,9 @@ pub unsafe fn rescan() {
         changed = true;
     }
     if changed {
+        for i in 0..app().fences.len() {
+            apply_auto_height(i);
+        }
         save();
     }
 }

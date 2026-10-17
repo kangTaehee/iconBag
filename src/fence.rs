@@ -56,6 +56,8 @@ pub struct Fence {
     pub portal: Option<PathBuf>,
     pub nav: Vec<PathBuf>,
     pub hover_expanded: bool,
+    pub auto_h: bool,      // 항목 수에 맞춰 높이 자동 조절
+    pub view: FolderView,  // 포털 정렬·표시 옵션
 }
 
 impl Fence {
@@ -82,6 +84,8 @@ impl Fence {
             portal: None,
             nav: Vec::new(),
             hover_expanded: false,
+            auto_h: false,
+            view: FolderView::default(),
         }
     }
     // 제목 표시줄 높이 (숨김이면 얇은 그립)
@@ -163,6 +167,13 @@ impl Fence {
 
 pub fn fence_idx(hwnd: HWND) -> Option<usize> {
     app().fences.iter().position(|f| f.hwnd == hwnd)
+}
+
+// 자동 높이: 내용(최소 한 줄)에 맞추되 max_h 를 넘지 않는다
+pub fn fit_height(f: &Fence, max_h: i32) -> i32 {
+    let (_, ch) = f.cell();
+    let min_h = f.th() + 2 * m(PAD) + ch;
+    f.content_h().max(min_h).min(max_h).max(f.th() + m(40))
 }
 
 // 현재 표시해야 할 창 높이
@@ -257,8 +268,10 @@ pub unsafe fn create_fence_window(idx: usize) {
         null(),
     );
     a.fences[idx].hwnd = hwnd;
-    let attached = attach_to_desktop(hwnd, x, y, w, h);
-    SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    let attached = attach_to_desktop(hwnd, x, y, w, h, alpha);
+    if !attached {
+        SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+    }
     DragAcceptFiles(hwnd, 1);
     apply_region(hwnd);
     if !a.fences_hidden {
@@ -352,13 +365,47 @@ pub unsafe fn set_title_hidden(idx: usize, hidden: bool) {
     let f = &mut app().fences[idx];
     f.title_hidden = hidden;
     apply_height(idx);
+    invalidate(idx);
     save();
 }
 
 pub unsafe fn invalidate(idx: usize) {
+    apply_auto_height(idx);
     let f = &mut app().fences[idx];
     f.clamp_scroll();
     InvalidateRect(f.hwnd, null(), 1);
+}
+
+// 자동 높이가 켜져 있으면 내용에 맞춰 창 높이를 바꾼다(모니터 작업 영역 아래로는 넘기지 않음)
+pub unsafe fn apply_auto_height(idx: usize) {
+    let f = &mut app().fences[idx];
+    if !f.auto_h || f.hwnd.is_null() {
+        return;
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    GetWindowRect(f.hwnd, &mut r);
+    let mut mi: MONITORINFO = core::mem::zeroed();
+    mi.cbSize = core::mem::size_of::<MONITORINFO>() as u32;
+    let max_h = if GetMonitorInfoW(MonitorFromWindow(f.hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+        mi.rcWork.bottom - r.top
+    } else {
+        i32::MAX
+    };
+    let h = fit_height(f, max_h);
+    if h == f.h {
+        return;
+    }
+    f.h = h;
+    if !(f.rolled && !f.hover_expanded) {
+        SetWindowPos(f.hwnd, null_mut(), 0, 0, f.w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        apply_region(f.hwnd);
+    }
+}
+
+pub unsafe fn set_auto_height(idx: usize, on: bool) {
+    app().fences[idx].auto_h = on;
+    invalidate(idx);
+    save();
 }
 
 // 다른 Fence 에 들어 있는 같은 경로를 제거한 뒤 대상 Fence 에 추가
@@ -453,6 +500,10 @@ pub unsafe fn paint(hwnd: HWND, idx: usize) {
         let icon_px = f.icon_px();
         let (cw, _) = f.cell();
         let size = f.icon_size;
+        // 아이콘은 처음 보일 때 읽는데, 셸 아이콘 추출은 파일당 수~수십 ms 걸린다.
+        // 한 번 그릴 때 ICON_BUDGET_MS 만 쓰고 나머지는 타이머로 이어서 읽어 크기 조절·스크롤이 멈추지 않게 한다.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ICON_BUDGET_MS);
+        let mut pending = false;
         for i in 0..f.items.len() {
             let r = f.cell_rect(i);
             if r.bottom < th || r.top > h {
@@ -467,7 +518,11 @@ pub unsafe fn paint(hwnd: HWND, idx: usize) {
             }
             let it = &mut f.items[i];
             if it.icon.is_null() {
-                it.icon = load_icon(&it.path, size);
+                if std::time::Instant::now() < deadline {
+                    it.icon = load_icon(&it.path, size);
+                } else {
+                    pending = true;
+                }
             }
             let ix = r.left + (cw - icon_px) / 2;
             let iy = r.top + m(6);
@@ -477,6 +532,9 @@ pub unsafe fn paint(hwnd: HWND, idx: usize) {
             let mut txt = RECT { left: r.left + 2, top: iy + icon_px + m(4), right: r.right - 2, bottom: r.bottom - 2 };
             let name = wide(&it.name);
             DrawTextW(mem, name.as_ptr(), -1, &mut txt, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX | DT_EDITCONTROL);
+        }
+        if pending {
+            SetTimer(hwnd, TIMER_ICONS, 1, None);
         }
         // 스크롤 표시
         let content = f.content_h();
@@ -525,15 +583,32 @@ pub unsafe fn menu_sub(menu: HMENU, sub: HMENU, text: &str) {
 pub unsafe fn fence_menu(idx: usize, x: i32, y: i32) {
     let a = app();
     let menu = CreatePopupMenu();
-    let (is_portal, nav_depth, rolled, locked, title_hidden, color, icon_size, alpha) = {
+    let (is_portal, nav_depth, rolled, locked, title_hidden, color, icon_size, alpha, auto_h, view) = {
         let f = &a.fences[idx];
-        (f.is_portal(), f.nav.len(), f.rolled, f.locked, f.title_hidden, f.color, f.icon_size, f.alpha)
+        (f.is_portal(), f.nav.len(), f.rolled, f.locked, f.title_hidden, f.color, f.icon_size, f.alpha, f.auto_h, f.view)
     };
     menu_item(menu, ID_F_RENAME, "이름 바꾸기\tF2", false);
     menu_item(menu, ID_F_ROLL, "말아 올리기 (제목만 표시)", rolled);
-    menu_item(menu, ID_F_SORT, "이름순 정렬", false);
-    if is_portal && nav_depth > 0 {
-        menu_item(menu, ID_F_BACK, "상위 폴더로\tBackspace", false);
+    if is_portal {
+        if nav_depth > 0 {
+            menu_item(menu, ID_F_BACK, "상위 폴더로\tBackspace", false);
+        }
+        // 폴더 보기 옵션 (포털은 새로 고칠 때마다 이 순서로 정렬된다)
+        let sub = CreatePopupMenu();
+        for (i, (key, _, label)) in SORT_KEYS.iter().enumerate() {
+            menu_item(sub, ID_F_PSORT0 + i, label, view.sort == *key);
+        }
+        menu_sep(sub);
+        menu_item(sub, ID_F_PASC, "오름차순", !view.desc);
+        menu_item(sub, ID_F_PDESC, "내림차순", view.desc);
+        menu_sep(sub);
+        menu_item(sub, ID_F_PDIRS, "폴더를 먼저 표시", view.dirs_first);
+        menu_item(sub, ID_F_PHIDDEN, "숨김 파일 표시", view.show_hidden);
+        menu_sep(sub);
+        menu_item(sub, ID_F_POPEN, "탐색기에서 이 폴더 열기", false);
+        menu_sub(menu, sub, "폴더 보기 옵션");
+    } else {
+        menu_item(menu, ID_F_SORT, "이름순 정렬", false);
     }
     menu_sep(menu);
 
@@ -553,6 +628,7 @@ pub unsafe fn fence_menu(idx: usize, x: i32, y: i32) {
         menu_item(sub, ID_F_COLOR0 + i, name, color == *c);
     }
     menu_sub(menu, sub, "색상");
+    menu_item(menu, ID_F_AUTOH, "아이콘 수에 맞춰 높이 자동 조절", auto_h);
     menu_item(menu, ID_F_TITLE, "제목 표시줄 숨기기", title_hidden);
     menu_item(menu, ID_F_LOCK, "잠금 (이동·크기 변경 방지)", locked);
     menu_sep(menu);
@@ -594,6 +670,19 @@ pub unsafe fn fence_menu(idx: usize, x: i32, y: i32) {
             save();
         }
         ID_F_BACK => portal_back(idx),
+        ID_F_AUTOH => set_auto_height(idx, !auto_h),
+        c if (ID_F_PSORT0..ID_F_PSORT0 + SORT_KEYS.len()).contains(&c) => {
+            set_folder_view(idx, FolderView { sort: SORT_KEYS[c - ID_F_PSORT0].0, ..view })
+        }
+        ID_F_PASC => set_folder_view(idx, FolderView { desc: false, ..view }),
+        ID_F_PDESC => set_folder_view(idx, FolderView { desc: true, ..view }),
+        ID_F_PDIRS => set_folder_view(idx, FolderView { dirs_first: !view.dirs_first, ..view }),
+        ID_F_PHIDDEN => set_folder_view(idx, FolderView { show_hidden: !view.show_hidden, ..view }),
+        ID_F_POPEN => {
+            if let Some(dir) = portal_dir(&app().fences[idx]) {
+                open_path(&dir.to_string_lossy());
+            }
+        }
         ID_F_ICON16 => set_icon_size(idx, 16),
         ID_F_ICON32 => set_icon_size(idx, 32),
         ID_F_ICON48 => set_icon_size(idx, 48),
@@ -928,8 +1017,9 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             let collapsed = f.rolled && !f.hover_expanded;
             let l = pt.x < b;
             let r = pt.x >= rc.right - b;
-            let t = !collapsed && pt.y < b;
-            let bt = !collapsed && pt.y >= rc.bottom - b;
+            // 자동 높이면 높이는 내용이 정하므로 위·아래 테두리로 크기를 바꾸지 않는다
+            let t = !collapsed && !f.auto_h && pt.y < b;
+            let bt = !collapsed && !f.auto_h && pt.y >= rc.bottom - b;
             let th = f.th();
             // 포털 뒤로 가기 버튼 영역은 클라이언트로 넘긴다
             let back_btn = f.is_portal() && !f.nav.is_empty() && !f.title_hidden && pt.y < th && pt.x < m(28);
@@ -992,6 +1082,11 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 return 0;
             }
         }
+        WM_TIMER if wp == TIMER_ICONS => {
+            KillTimer(hwnd, TIMER_ICONS);
+            InvalidateRect(hwnd, null(), 0);
+            return 0;
+        }
         WM_TIMER if wp == TIMER_HOVER => {
             // 커서가 창 밖으로 나가면 다시 접는다
             let f = &mut app().fences[idx];
@@ -1024,11 +1119,16 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                     f.y = r.top;
                 }
             }
+            let width_changed = f.w != r.right - r.left;
             f.w = r.right - r.left;
             if !f.rolled {
                 f.h = r.bottom - r.top;
             }
             if msg == WM_SIZE {
+                if width_changed {
+                    apply_auto_height(idx);
+                }
+                let f = &mut app().fences[idx];
                 apply_region(hwnd);
                 f.clamp_scroll();
                 InvalidateRect(hwnd, null(), 1);

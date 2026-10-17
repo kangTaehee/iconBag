@@ -77,8 +77,13 @@ pub fn serialize() -> String {
         s.push_str(&format!("alpha={}\n", f.alpha));
         s.push_str(&format!("title_hidden={}\n", f.title_hidden as u8));
         s.push_str(&format!("locked={}\n", f.locked as u8));
+        s.push_str(&format!("auto_height={}\n", f.auto_h as u8));
         if let Some(p) = &f.portal {
             s.push_str(&format!("portal={}\n", p.to_string_lossy()));
+            s.push_str(&format!("sort={}\n", f.view.sort.as_str()));
+            s.push_str(&format!("sort_desc={}\n", f.view.desc as u8));
+            s.push_str(&format!("dirs_first={}\n", f.view.dirs_first as u8));
+            s.push_str(&format!("show_hidden={}\n", f.view.show_hidden as u8));
         } else {
             for it in &f.items {
                 s.push_str(&format!("item={}\n", it.path));
@@ -150,6 +155,11 @@ pub fn parse_into(text: &str) {
             ("alpha", Some(f)) => f.alpha = v.parse::<u8>().unwrap_or(ALPHA).max(40),
             ("title_hidden", Some(f)) => f.title_hidden = v == "1",
             ("locked", Some(f)) => f.locked = v == "1",
+            ("auto_height", Some(f)) => f.auto_h = v == "1",
+            ("sort", Some(f)) => f.view.sort = SortKey::parse(v),
+            ("sort_desc", Some(f)) => f.view.desc = v == "1",
+            ("dirs_first", Some(f)) => f.view.dirs_first = v == "1",
+            ("show_hidden", Some(f)) => f.view.show_hidden = v == "1",
             ("portal", Some(f)) => f.portal = Some(PathBuf::from(v)),
             ("item", Some(f)) => f.items.push(Item::new(v)),
             _ => {}
