@@ -2,13 +2,77 @@
 #![allow(unused_imports, dead_code)]
 use crate::*;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU8, Ordering::Relaxed};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 pub const HK_TOGGLE: i32 = 1;
 pub const HK_PEEK: i32 = 2;
 pub const MOD_NOREPEAT_FLAG: u32 = 0x4000;
+
+// ───────────────────────── 훅 스레드와 공유하는 상태 ─────────────────────────
+// 저수준 훅은 설치한 스레드에서 실행되고, 그 스레드가 바쁘면 시스템 전체의 마우스·키 입력이 함께 밀린다.
+// 그래서 훅은 메시지 루프만 도는 전용 스레드에 두고, UI 스레드의 App 대신 아래 원자 변수만 읽는다.
+// UI 스레드는 값이 바뀔 때 set_* 로 갱신한다.
+static HOOK_MAIN: AtomicIsize = AtomicIsize::new(0);
+static HOOK_THREAD: AtomicU32 = AtomicU32::new(0);
+static HOOK_PEEKING: AtomicBool = AtomicBool::new(false);
+static HOOK_FOCUSED: AtomicBool = AtomicBool::new(false);
+static HOOK_BAND: AtomicBool = AtomicBool::new(false);
+static HOOK_CORNER: AtomicU8 = AtomicU8::new(0);
+static HOOK_CORNER_ARMED: AtomicBool = AtomicBool::new(false);
+// 더블클릭 판정용 직전 클릭 (훅 스레드 전용)
+static mut LAST_CLICK: (u32, i32, i32) = (0, 0, 0);
+
+pub fn set_peeking(on: bool) {
+    app().peeking = on;
+    HOOK_PEEKING.store(on, Relaxed);
+}
+pub fn set_focused(f: Option<usize>) {
+    app().focused = f;
+    HOOK_FOCUSED.store(f.is_some(), Relaxed);
+}
+pub fn set_band_start(p: Option<POINT>) {
+    app().band_start = p;
+    HOOK_BAND.store(p.is_some(), Relaxed);
+}
+pub fn set_hot_corner(c: u8) {
+    app().hot_corner = c;
+    HOOK_CORNER.store(c, Relaxed);
+    HOOK_CORNER_ARMED.store(false, Relaxed);
+}
+
+fn hook_main() -> HWND {
+    HOOK_MAIN.load(Relaxed) as HWND
+}
+
+// 훅 스레드 시작: 훅을 설치하고 WM_QUIT 이 올 때까지 메시지 루프를 돈다
+pub unsafe fn start_hook_thread() {
+    let a = app();
+    HOOK_MAIN.store(a.main as isize, Relaxed);
+    HOOK_CORNER.store(a.hot_corner, Relaxed);
+    let hinst = a.hinst as isize;
+    std::thread::spawn(move || unsafe {
+        HOOK_THREAD.store(GetCurrentThreadId(), Relaxed);
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst as HINSTANCE, 0);
+        let kbd = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), hinst as HINSTANCE, 0);
+        let mut msg: MSG = core::mem::zeroed();
+        while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            DispatchMessageW(&msg);
+        }
+        UnhookWindowsHookEx(mouse);
+        UnhookWindowsHookEx(kbd);
+    });
+}
+
+pub unsafe fn stop_hook_thread() {
+    let tid = HOOK_THREAD.load(Relaxed);
+    if tid != 0 {
+        PostThreadMessageW(tid, WM_QUIT, 0, 0);
+    }
+}
 
 pub unsafe fn register_hotkeys() {
     let a = app();
@@ -20,7 +84,10 @@ pub unsafe fn register_hotkeys() {
 
 // 커서가 설정된 핫코너(가상 화면 모서리 3px 이내)에 있는지
 pub unsafe fn in_hot_corner(pt: POINT) -> bool {
-    let c = app().hot_corner;
+    in_corner(pt, app().hot_corner)
+}
+
+unsafe fn in_corner(pt: POINT, c: u8) -> bool {
     if c == 0 {
         return false;
     }
@@ -41,41 +108,41 @@ pub unsafe fn in_hot_corner(pt: POINT) -> bool {
 pub unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let ms = &*(lp as *const MSLLHOOKSTRUCT);
-        let a = app();
+        let main = hook_main();
         match wp as u32 {
             WM_LBUTTONDOWN => {
-                let (t0, x0, y0) = a.last_click;
+                let (t0, x0, y0) = LAST_CLICK;
                 if t0 != 0
                     && ms.time.wrapping_sub(t0) <= GetDoubleClickTime()
                     && (ms.pt.x - x0).abs() <= 4
                     && (ms.pt.y - y0).abs() <= 4
                 {
-                    a.last_click = (0, 0, 0);
-                    PostMessageW(a.main, WM_DESKTOP_DBLCLK, ms.pt.x as usize, ms.pt.y as isize);
+                    LAST_CLICK = (0, 0, 0);
+                    PostMessageW(main, WM_DESKTOP_DBLCLK, ms.pt.x as usize, ms.pt.y as isize);
                 } else {
-                    a.last_click = (ms.time, ms.pt.x, ms.pt.y);
+                    LAST_CLICK = (ms.time, ms.pt.x, ms.pt.y);
                 }
-                if a.peeking {
-                    PostMessageW(a.main, WM_PEEK_CLICK, ms.pt.x as usize, ms.pt.y as isize);
+                if HOOK_PEEKING.load(Relaxed) {
+                    PostMessageW(main, WM_PEEK_CLICK, ms.pt.x as usize, ms.pt.y as isize);
                 }
-                PostMessageW(a.main, WM_BAND_DOWN, ms.pt.x as usize, ms.pt.y as isize);
+                PostMessageW(main, WM_BAND_DOWN, ms.pt.x as usize, ms.pt.y as isize);
             }
             WM_MOUSEMOVE => {
-                if a.band_start.is_some() {
-                    PostMessageW(a.main, WM_BAND_MOVE, ms.pt.x as usize, ms.pt.y as isize);
+                if HOOK_BAND.load(Relaxed) {
+                    PostMessageW(main, WM_BAND_MOVE, ms.pt.x as usize, ms.pt.y as isize);
                 }
-                if a.hot_corner != 0 {
-                    let inside = in_hot_corner(ms.pt);
-                    if inside != a.corner_armed {
-                        a.corner_armed = inside;
-                        PostMessageW(a.main, WM_HOTCORNER, inside as usize, 0);
+                let corner = HOOK_CORNER.load(Relaxed);
+                if corner != 0 {
+                    let inside = in_corner(ms.pt, corner);
+                    if inside != HOOK_CORNER_ARMED.load(Relaxed) {
+                        HOOK_CORNER_ARMED.store(inside, Relaxed);
+                        PostMessageW(main, WM_HOTCORNER, inside as usize, 0);
                     }
                 }
             }
             WM_LBUTTONUP => {
-                if a.band_start.is_some() {
-                    PostMessageW(a.main, WM_BAND_UP, ms.pt.x as usize, ms.pt.y as isize);
-                }
+                // WM_BAND_DOWN 이 아직 처리되기 전일 수 있으므로 항상 보낸다(band_start 가 없으면 무시됨)
+                PostMessageW(main, WM_BAND_UP, ms.pt.x as usize, ms.pt.y as isize);
             }
             _ => {}
         }
@@ -89,19 +156,19 @@ pub unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -
     if code >= 0 && (wp as u32 == WM_KEYDOWN || wp as u32 == WM_SYSKEYDOWN) {
         let kb = &*(lp as *const KBDLLHOOKSTRUCT);
         let vk = kb.vkCode;
-        let a = app();
-        let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
-        if a.peeking && vk == VK_ESCAPE as u32 {
-            PostMessageW(a.main, WM_KEY, vk as usize, 0);
+        let main = hook_main();
+        let ctrl = GetAsyncKeyState(VK_CONTROL as i32) < 0;
+        if HOOK_PEEKING.load(Relaxed) && vk == VK_ESCAPE as u32 {
+            PostMessageW(main, WM_KEY, vk as usize, 0);
             return 1;
         }
-        if a.focused.is_some() && desktop_is_foreground() {
+        if HOOK_FOCUSED.load(Relaxed) && desktop_is_foreground() {
             let handled = matches!(
                 vk as u16,
                 VK_RETURN | VK_DELETE | VK_F2 | VK_ESCAPE | VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT | VK_BACK
             ) || (ctrl && vk == b'A' as u32);
             if handled {
-                PostMessageW(a.main, WM_KEY, vk as usize, ctrl as isize);
+                PostMessageW(main, WM_KEY, vk as usize, ctrl as isize);
                 return 1;
             }
         }
@@ -118,7 +185,7 @@ pub unsafe fn handle_key(vk: u32, ctrl: bool) {
     }
     let Some(idx) = a.focused else { return };
     if idx >= a.fences.len() {
-        a.focused = None;
+        set_focused(None);
         return;
     }
     let f = &mut a.fences[idx];

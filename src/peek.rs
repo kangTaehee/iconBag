@@ -58,7 +58,7 @@ pub unsafe fn peek_start() {
     if a.peeking {
         return;
     }
-    a.peeking = true;
+    set_peeking(true);
     a.peek_was_hidden = a.fences_hidden;
     for i in 0..a.fences.len() {
         let (hwnd, alpha) = (a.fences[i].hwnd, a.fences[i].alpha);
@@ -75,7 +75,7 @@ pub unsafe fn peek_end() {
     if !a.peeking {
         return;
     }
-    a.peeking = false;
+    set_peeking(false);
     for i in 0..a.fences.len() {
         let f = &a.fences[i];
         if f.hwnd.is_null() {

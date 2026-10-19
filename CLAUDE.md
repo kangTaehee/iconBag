@@ -27,12 +27,14 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
 - 툴체인: `rust-toolchain.toml` 이 `stable-x86_64-pc-windows-gnu` 를 고정한다. 이 PC 에는 MSVC 빌드 도구/Windows SDK 가 없어
   rustup 에 번들된 MinGW 링커를 쓰기 위함이다. (`rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal`)
 - release 프로필은 `opt-level="z"`, LTO, `panic="abort"`, `strip` 이다. 배포용 실행 파일은 `dist/icondocs.exe` 로 커밋되어 있다.
+- `build.rs` 가 빌드 전용 크레이트 `embed-manifest` 로 실행 파일 매니페스트(supportedOS Win7~11, PerMonitorV2)를 넣는다.
+  이 PC 의 GNU 툴체인에는 windres/rc 가 없어서 리소스 컴파일러 없이 COFF 오브젝트를 만드는 이 크레이트를 쓴다.
 - 설정 파일: `%APPDATA%\IconDocs\layout.txt` (단순 key=value 텍스트), 스냅샷은 `snapshots\*.txt`, 패닉 기록은 `crash.log`.
   `layout.txt` 를 삭제하면 다음 실행 때 자동 정리를 다시 수행한다.
 - 실행 중인 exe 는 덮어쓸 수 없으므로 다시 빌드하기 전에 앱을 정상 종료해야 한다(아래 WM_CLOSE 참고).
 
 ## 테스트
-- 단위 테스트: `cargo test --release` (단일 테스트는 `cargo test --release <이름 일부>`). 현재는 `portal.rs` 의 폴더 정렬 비교(`compare_entries`, `SortKey`)만 있다.
+- 단위 테스트: `cargo test --release` (단일 테스트는 `cargo test --release <이름 일부>`). `portal.rs` 의 폴더 정렬 비교(`compare_entries`, `SortKey`), `desktop.rs` 의 `is_on_desktop`·`unique_path`·`create_shortcut`(실제 .lnk 생성) 테스트가 있다.
   `util.rs` 의 `glob_match`/`parse_hotkey`, `config.rs` 의 `rule_matches`, `snapshot.rs` 의 `sanitize` 도 순수 함수라 테스트하기 쉽다.
   `parse_into`·`m()` 처럼 전역 `APP` 을 쓰는 함수는 테스트에서 `APP` 을 먼저 초기화해야 한다.
 - 통합 확인은 실제 바탕화면에서 하며, 다음 함정이 있다.
@@ -44,6 +46,11 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
     Fence HWND 단독 `PrintWindow` 는 검게 나와 판단에 쓸 수 없다.
   - 실행 중인 exe 는 빌드 산출물을 잠그므로 `target/release/icondocs.exe` 를 다른 곳에 복사해 실행한다.
   - 파일이 수천 개인 폴더(예: System32) 포털은 성능 측정용이다. 측정이 끝나면 `layout.txt` 에서 지울 것.
+  - 테스트용 Fence 는 `layout.txt` 에 제목을 붙여 추가하고(예: `title=XTEST`) 끝나면 그 블록만 지운다. 사용자 Fence 는 건드리지 않는다.
+  - `IconDocsMain` 에 WM_CLOSE 를 보내면 **사용자가 쓰던 인스턴스도 닫힌다**(중복 실행 방지로 하나뿐). 테스트 후 다시 띄워 줄 것.
+  - 투명도는 Progman `PrintWindow` 에서 Fence 영역 평균색을 alpha 255/128 로 비교하면 확인된다(같으면 투명도 무시).
+  - 포털 동작은 Fence 에 `WM_LBUTTONDBLCLK`(항목 좌표) / `WM_XBUTTONUP`(wParam 상위 워드 1) 을 PostMessage 해 확인한다.
+  - 핫코너는 **가상 화면** 모서리 기준이다. 보조 모니터가 있으면 `mouse_event` 에 `MOUSEEVENTF_VIRTUALDESK` 를 붙여야 그 모서리로 간다.
 - 강제 종료(taskkill /F)하면 아이콘이 숨겨진 채 남는다. 테스트 후에는 메인 창(`IconDocsMain` 클래스)에 WM_CLOSE 를 보내 정상 종료할 것.
 
 ## 아키텍처 (여러 파일에 걸친 흐름)
@@ -51,13 +58,17 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
   `main.rs` 가 모든 모듈을 `pub use x::*` 로 재노출하고 각 모듈은 `use crate::*` 를 쓰므로, 함수·상수 이름은 crate 전체에서 겹치면 안 된다.
 - **Fence 식별**: Fence 는 `app().fences: Vec<Fence>` 의 인덱스로 다룬다. 창 프로시저는 `fence_idx(hwnd)` 로 인덱스를 찾는다.
   `delete_fence` 는 뒤 인덱스를 당기므로 `focused` 처럼 인덱스를 들고 있는 상태를 함께 보정해야 한다.
-- **훅 → 메인 창**: 저수준 훅(`input.rs`)은 상태를 직접 바꾸지 않고 `WM_APP+n` 메시지(`WM_DESKTOP_DBLCLK`, `WM_BAND_*`, `WM_KEY`,
+- **훅 스레드 → 메인 창**: 저수준 훅(`input.rs`)은 `start_hook_thread()` 가 만든 **전용 스레드**에서 돈다. 훅은 `App` 을 읽지 않고
+  원자 변수(피크·포커스·밴드 드래그·핫코너)만 읽으며, `WM_APP+n` 메시지(`WM_DESKTOP_DBLCLK`, `WM_BAND_*`, `WM_KEY`,
   `WM_PEEK_CLICK`, `WM_HOTCORNER`)를 메인 창에 post 한다. 실제 처리는 `main_proc` 에서 한다.
+  그래서 `peeking`·`focused`·`band_start`·`hot_corner` 는 직접 대입하지 말고 `set_peeking`/`set_focused`/`set_band_start`/`set_hot_corner` 로 바꾼다.
 - **저장**: 상태를 바꾸는 동작은 끝에 `save()` 를 호출해 `layout.txt` 전체를 다시 쓴다. 스냅샷도 같은 `serialize()`/`parse_into()` 를 쓰며,
   `apply_layout` 은 모든 Fence 창을 없애고 다시 만든다.
 - **재검색 루프**: 메인 창 타이머(`TIMER_RESCAN`, 3초)가 `rescan()` 을 부른다. 사라진 파일은 제거하고, 어느 Fence 에도 없는 새 파일은
   첫 매칭 규칙(`Rule.target` = Fence 제목)으로, 없으면 "새 항목" Fence 로 보낸다. 대상 제목의 Fence 가 없으면 새로 만든다.
   explorer 가 재시작되어 `defview` 가 무효해지면 `reattach()` 로 모든 Fence 창을 다시 만든다.
+  재검색은 바탕화면 폴더(사용자/공용) 바로 아래만 보므로, 그 밖의 파일을 Fence 항목으로 넣으면 3초 뒤 지워진다.
+  탐색기 드롭(`WM_DROPFILES`)은 `desktop_entry_for` 로 사용자 바탕화면에 바로 가기(.lnk, `IShellLinkW` 수동 vtable)를 만들어 그 경로를 넣는다.
 - **일반 Fence vs 포털**: `Fence.portal` 이 `Some` 이면 항목은 그 폴더(`nav` 스택의 마지막)에서 매번 스캔하며 저장되지 않는다.
   정렬·숨김 파일 표시는 `Fence.view`(`FolderView`)가 정하고 새로 고칠 때마다 다시 적용된다.
   규칙 분류·`rescan`·Fence 간 드래그는 포털을 제외한다. 포털로 드롭하면 파일을 실제로 이동한다(`MoveFileExW`).
@@ -80,6 +91,13 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
   파일 5000개 폴더에서 UI 가 4.5초씩 멈췄다. 메타데이터는 `scan_entries()`(DirEntry 재사용)로 한 번만 얻는다.
 - 아이콘(`SHGetFileInfoW`)은 그리기 중에 처음 읽는다. 한 번 그릴 때 `ICON_BUDGET_MS` 만 쓰고 나머지는 `TIMER_ICONS` 로 이어 읽는다.
   이 예산이 없으면 처음 크기를 조절하거나 스크롤할 때 수 초씩 멈춘다.
+- **매니페스트가 없으면 Fence 투명도가 무시된다**: 레이어드 "자식" 창은 Windows 8+ 호환을 선언한 앱에서만 동작한다.
+  선언이 없으면 `SetLayeredWindowAttributes` 가 성공하고 `GetLayeredWindowAttributes` 도 설정값을 돌려주지만 화면은 불투명하다.
+- **저수준 훅을 UI 스레드에 두지 말 것**: `WH_MOUSE_LL`/`WH_KEYBOARD_LL` 은 설치한 스레드에서 실행되므로, 그 스레드가 아이콘 로드 등으로 바쁘면
+  **시스템 전체** 마우스·키 입력이 밀린다(초기 실행 버벅임의 원인). 훅은 전용 스레드에 두고 UI 상태는 원자 변수로 넘긴다.
+  훅 스레드에서는 `GetKeyState` 대신 `GetAsyncKeyState` 를 쓴다(스레드별 키 상태라 값이 틀림).
+- 마우스 뒤로 가기(XBUTTON1)는 클라이언트에서 `WM_XBUTTONUP`, 제목(HTCAPTION) 위에서 `WM_NCXBUTTONUP` 으로 온다. 처리했으면 TRUE 를 돌려
+  `WM_APPCOMMAND` 가 부모(explorer)로 올라가지 않게 한다.
 - 제목 영역은 `WM_NCHITTEST` 가 HTCAPTION 을 돌려주므로 마우스 이동은 `WM_NCMOUSEMOVE` 로 온다(hover 펼치기 처리 시 주의).
 - 48px 아이콘은 windows-sys 에 COM 인터페이스가 없어 `IImageList` vtable 을 수동 선언해 `GetIcon` 을 호출한다(`fence.rs`).
 - 크기·좌표 상수는 96 DPI 기준이며 `m()` 으로 현재 DPI 에 맞춰 환산해서 쓴다.

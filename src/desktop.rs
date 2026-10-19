@@ -5,9 +5,9 @@ use core::ffi::c_void;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use windows_sys::core::PWSTR;
+use windows_sys::core::{GUID, HRESULT, PWSTR};
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -83,6 +83,130 @@ pub fn scan_dir(d: &Path) -> Vec<PathBuf> {
 
 pub fn scan_desktop(dirs: &[PathBuf]) -> Vec<PathBuf> {
     dirs.iter().flat_map(|d| scan_dir(d)).collect()
+}
+
+// 바탕화면 폴더(사용자/공용) 바로 아래 있는 항목인지. 재검색은 이 폴더들만 보므로 밖의 항목은 지워진다.
+pub fn is_on_desktop(path: &Path, dirs: &[PathBuf]) -> bool {
+    let Some(parent) = path.parent() else { return false };
+    let parent = lower(&parent.to_string_lossy());
+    dirs.iter().any(|d| lower(&d.to_string_lossy()) == parent)
+}
+
+// dir 안에서 겹치지 않는 경로: "이름.ext", "이름 (2).ext", "이름 (3).ext" ...
+pub fn unique_path(dir: &Path, stem: &str, ext: &str, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let mut p = dir.join(format!("{}.{}", stem, ext));
+    let mut n = 2;
+    while exists(&p) {
+        p = dir.join(format!("{} ({}).{}", stem, n, ext));
+        n += 1;
+    }
+    p
+}
+
+// 바로 가기(.lnk) 생성: windows-sys 에 COM 인터페이스가 없어 IShellLinkW/IPersistFile vtable 을 수동 선언한다
+#[repr(C)]
+struct IShellLinkWVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    add_ref: usize,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    get_path: usize,
+    get_id_list: usize,
+    set_id_list: usize,
+    get_description: usize,
+    set_description: usize,
+    get_working_directory: usize,
+    set_working_directory: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+    get_arguments: usize,
+    set_arguments: usize,
+    get_hotkey: usize,
+    set_hotkey: usize,
+    get_show_cmd: usize,
+    set_show_cmd: usize,
+    get_icon_location: usize,
+    set_icon_location: usize,
+    set_relative_path: usize,
+    resolve: usize,
+    set_path: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+}
+#[repr(C)]
+struct IPersistFileVtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    get_class_id: usize,
+    is_dirty: usize,
+    load: usize,
+    save: unsafe extern "system" fn(*mut c_void, *const u16, BOOL) -> HRESULT,
+}
+const CLSID_SHELL_LINK: GUID = GUID {
+    data1: 0x00021401,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+const IID_ISHELLLINKW: GUID = GUID {
+    data1: 0x000214F9,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+const IID_IPERSISTFILE: GUID = GUID {
+    data1: 0x0000010B,
+    data2: 0,
+    data3: 0,
+    data4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
+};
+
+pub unsafe fn create_shortcut(target: &Path, lnk: &Path) -> bool {
+    let mut sl: *mut c_void = null_mut();
+    if CoCreateInstance(&CLSID_SHELL_LINK, null_mut(), CLSCTX_INPROC_SERVER, &IID_ISHELLLINKW, &mut sl) < 0 || sl.is_null() {
+        return false;
+    }
+    let vt = &**(sl as *mut *mut IShellLinkWVtbl);
+    let mut ok = (vt.set_path)(sl, wide(&target.to_string_lossy()).as_ptr()) >= 0;
+    // 탐색기의 "바로 가기 만들기"처럼 파일이면 시작 위치를 그 폴더로
+    if let (false, Some(dir)) = (target.is_dir(), target.parent()) {
+        (vt.set_working_directory)(sl, wide(&dir.to_string_lossy()).as_ptr());
+    }
+    let mut pf: *mut c_void = null_mut();
+    if ok && (vt.query_interface)(sl, &IID_IPERSISTFILE, &mut pf) >= 0 && !pf.is_null() {
+        let pvt = &**(pf as *mut *mut IPersistFileVtbl);
+        ok = (pvt.save)(pf, wide(&lnk.to_string_lossy()).as_ptr(), 1) >= 0;
+        (pvt.release)(pf);
+    } else {
+        ok = false;
+    }
+    (vt.release)(sl);
+    ok
+}
+
+// 탐색기에서 드롭한 경로를 Fence 항목으로 쓸 바탕화면 경로로 바꾼다.
+// 바탕화면 밖의 항목은 사용자 바탕화면에 바로 가기를 만들고, 이미 바로 가기(.lnk/.url)면 바로 가기의 바로 가기 대신 복사한다.
+pub unsafe fn desktop_entry_for(path: &Path) -> Option<String> {
+    let dirs = &app().desktop_dirs;
+    if is_on_desktop(path, dirs) {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    let desk = dirs.first()?;
+    let ext = file_ext(path);
+    let dest = if ext == "lnk" || ext == "url" {
+        let dest = unique_path(desk, &path.file_stem()?.to_string_lossy(), &ext, |p| p.exists());
+        std::fs::copy(path, &dest).ok()?;
+        dest
+    } else {
+        let name = if path.is_dir() { path.file_name() } else { path.file_stem() };
+        // 드라이브 루트(D:\)는 이름이 없으므로 "D" 로
+        let name = match name {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => path.to_string_lossy().trim_end_matches(['\\', '/', ':']).to_string(),
+        };
+        let dest = unique_path(desk, &name, "lnk", |p| p.exists());
+        if !create_shortcut(path, &dest) {
+            return None;
+        }
+        dest
+    };
+    Some(dest.to_string_lossy().into_owned())
 }
 
 pub fn class_name(hwnd: HWND) -> String {
@@ -294,5 +418,58 @@ pub unsafe fn clamp_fences_to_screen() {
             f.y = ny;
             SetWindowPos(f.hwnd, null_mut(), nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dirs() -> Vec<PathBuf> {
+        vec![PathBuf::from(r"C:\Users\u\Desktop"), PathBuf::from(r"C:\Users\Public\Desktop")]
+    }
+
+    #[test]
+    fn should_treat_file_directly_in_desktop_dir_as_on_desktop_ignoring_case() {
+        assert!(is_on_desktop(Path::new(r"C:\Users\u\Desktop\a.txt"), &dirs()));
+        assert!(is_on_desktop(Path::new(r"c:\users\public\desktop\App.lnk"), &dirs()));
+    }
+
+    #[test]
+    fn should_not_treat_file_outside_or_nested_under_desktop_as_on_desktop() {
+        assert!(!is_on_desktop(Path::new(r"C:\Users\u\Documents\a.txt"), &dirs()));
+        assert!(!is_on_desktop(Path::new(r"C:\Users\u\Desktop\sub\a.txt"), &dirs()));
+        assert!(!is_on_desktop(Path::new(r"D:\"), &dirs()));
+    }
+
+    #[test]
+    fn should_use_plain_name_when_no_file_exists() {
+        let p = unique_path(Path::new(r"C:\d"), "보고서", "lnk", |_| false);
+        assert_eq!(p, PathBuf::from(r"C:\d\보고서.lnk"));
+    }
+
+    #[test]
+    fn should_append_next_free_number_when_names_are_taken() {
+        let taken = [PathBuf::from(r"C:\d\a.lnk"), PathBuf::from(r"C:\d\a (2).lnk")];
+        let p = unique_path(Path::new(r"C:\d"), "a", "lnk", |p| taken.iter().any(|t| t == p));
+        assert_eq!(p, PathBuf::from(r"C:\d\a (3).lnk"));
+    }
+
+    #[test]
+    fn should_create_valid_shell_link_file_for_target() {
+        let dir = std::env::temp_dir().join(format!("icondocs_lnk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "x").unwrap();
+        let lnk = dir.join("target.lnk");
+        let ok = unsafe {
+            windows_sys::Win32::System::Com::CoInitializeEx(null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32);
+            create_shortcut(&target, &lnk)
+        };
+        let bytes = std::fs::read(&lnk).unwrap_or_default();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(ok);
+        // .lnk 헤더: HeaderSize(0x4C) 다음에 CLSID_ShellLink
+        assert_eq!(&bytes[..8], &[0x4C, 0, 0, 0, 0x01, 0x14, 0x02, 0x00]);
     }
 }

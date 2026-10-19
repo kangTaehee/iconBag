@@ -304,10 +304,10 @@ pub unsafe fn delete_fence(idx: usize) {
         DestroyWindow(f.hwnd);
     }
     if a.focused == Some(idx) {
-        a.focused = None;
+        set_focused(None);
     } else if let Some(fi) = a.focused {
         if fi > idx {
-            a.focused = Some(fi - 1);
+            set_focused(Some(fi - 1));
         }
     }
     save();
@@ -1056,7 +1056,7 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             return 0;
         }
         WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN => {
-            app().focused = Some(idx);
+            set_focused(Some(idx));
             // 키 입력을 받기 위해 바탕화면을 전경으로
             if !app().peeking {
                 SetForegroundWindow(GetAncestor(hwnd, GA_ROOT));
@@ -1149,7 +1149,7 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
         }
         WM_LBUTTONDOWN => {
             let a = app();
-            a.focused = Some(idx);
+            set_focused(Some(idx));
             if !a.peeking {
                 SetForegroundWindow(GetAncestor(hwnd, GA_ROOT));
             }
@@ -1243,7 +1243,7 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             return 0;
         }
         WM_RBUTTONUP => {
-            app().focused = Some(idx);
+            set_focused(Some(idx));
             let mut spt = POINT { x: mx, y: my };
             ClientToScreen(hwnd, &mut spt);
             match app().fences[idx].hit_item(mx, my) {
@@ -1258,6 +1258,15 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 None => fence_menu(idx, spt.x, spt.y),
             }
             return 0;
+        }
+        // 마우스 뒤로 가기 버튼: 포털이면 상위 폴더로 (제목 영역은 WM_NCXBUTTONUP 으로 온다)
+        WM_XBUTTONUP | WM_NCXBUTTONUP | WM_XBUTTONDOWN | WM_NCXBUTTONDOWN if app().fences[idx].is_portal() => {
+            let button = ((wp >> 16) & 0xFFFF) as u16;
+            if button == XBUTTON_BACK && (msg == WM_XBUTTONUP || msg == WM_NCXBUTTONUP) {
+                portal_back(idx);
+            }
+            // TRUE 를 돌려 WM_APPCOMMAND 가 부모(explorer)로 올라가지 않게 한다
+            return 1;
         }
         WM_DROPFILES => {
             let hdrop = wp as HDROP;
@@ -1275,8 +1284,11 @@ pub unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 portal_move_in(idx, &paths);
                 rescan();
             } else {
+                // 바탕화면 밖의 파일은 재검색에서 지워지므로 바로 가기로 바꿔 넣는다
                 for p in &paths {
-                    add_item_to(idx, p);
+                    if let Some(p) = desktop_entry_for(Path::new(p)) {
+                        add_item_to(idx, &p);
+                    }
                 }
                 save();
             }

@@ -119,7 +119,7 @@ pub fn parse_into(text: &str) {
             ("icons_hidden", None) => a.icons_hidden = v == "1",
             ("fences_hidden", None) => a.fences_hidden = v == "1",
             ("hover_expand", None) => a.hover_expand = v == "1",
-            ("hot_corner", None) => a.hot_corner = v.parse().unwrap_or(0),
+            ("hot_corner", None) => set_hot_corner(v.parse().unwrap_or(0)),
             ("hotkey_toggle", None) => {
                 if let Some(h) = parse_hotkey(v) {
                     a.hotkey_toggle = h;

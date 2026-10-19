@@ -56,6 +56,7 @@ pub const WM_BAND_UP: u32 = WM_APP + 6;
 pub const WM_PEEK_CLICK: u32 = WM_APP + 7;
 pub const WM_HOTCORNER: u32 = WM_APP + 8;
 pub const WM_KEY: u32 = WM_APP + 9;
+pub const XBUTTON_BACK: u16 = 0x0001; // XBUTTON1 = 마우스 뒤로 가기 버튼
 pub const TIMER_RESCAN: usize = 1;
 pub const TIMER_HOVER: usize = 2;
 pub const TIMER_TRAYCLICK: usize = 3;
@@ -130,10 +131,7 @@ pub struct App {
     pub icons_hidden: bool,
     pub font: HFONT,
     pub font_b: HFONT,
-    pub hook: HHOOK,
-    pub kbd_hook: HHOOK,
     pub desktop_dirs: Vec<PathBuf>,
-    pub last_click: (u32, i32, i32),
     pub band_start: Option<POINT>, // 바탕화면 드래그로 새 Fence 만들기
     pub band_hwnd: HWND,
     pub dpi: i32,
@@ -141,7 +139,6 @@ pub struct App {
     pub focused: Option<usize>, // 키보드 대상 Fence
     pub hover_expand: bool,
     pub hot_corner: u8,
-    pub corner_armed: bool,
     pub hotkey_toggle: (u32, u32),
     pub hotkey_peek: (u32, u32),
     pub peeking: bool,
@@ -234,8 +231,7 @@ unsafe fn tray_menu() {
             DestroyWindow(a.main);
         }
         c if (ID_TRAY_CORNER0..ID_TRAY_CORNER0 + CORNERS.len()).contains(&c) => {
-            a.hot_corner = (c - ID_TRAY_CORNER0) as u8;
-            a.corner_armed = false;
+            set_hot_corner((c - ID_TRAY_CORNER0) as u8);
             save();
         }
         c if (ID_TRAY_SNAP0..ID_TRAY_SNAP0 + SNAP_MAX).contains(&c) => {
@@ -353,9 +349,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let pt = POINT { x: wp as i32, y: lp as i32 };
             if is_empty_desktop(pt) {
                 let a = app();
-                a.band_start = Some(pt);
+                set_band_start(Some(pt));
                 // 바탕화면 빈 곳 클릭: 선택 해제
-                a.focused = None;
+                set_focused(None);
                 for i in 0..a.fences.len() {
                     if !a.fences[i].sel.is_empty() {
                         a.fences[i].sel.clear();
@@ -396,7 +392,8 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_BAND_UP => {
             let a = app();
-            let Some(s) = a.band_start.take() else { return 0 };
+            let Some(s) = a.band_start else { return 0 };
+            set_band_start(None);
             let had_band = !a.band_hwnd.is_null();
             if had_band {
                 DestroyWindow(a.band_hwnd);
@@ -432,12 +429,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     DestroyWindow(f.hwnd);
                 }
             }
-            if !a.hook.is_null() {
-                UnhookWindowsHookEx(a.hook);
-            }
-            if !a.kbd_hook.is_null() {
-                UnhookWindowsHookEx(a.kbd_hook);
-            }
+            stop_hook_thread();
             UnregisterHotKey(hwnd, HK_TOGGLE);
             UnregisterHotKey(hwnd, HK_PEEK);
             PostQuitMessage(0);
@@ -520,10 +512,7 @@ fn main() {
             icons_hidden: false,
             font: mkfont(11, FW_NORMAL as i32),
             font_b: mkfont(12, FW_SEMIBOLD as i32),
-            hook: null_mut(),
-            kbd_hook: null_mut(),
             desktop_dirs: dirs,
-            last_click: (0, 0, 0),
             band_start: None,
             band_hwnd: null_mut(),
             dpi,
@@ -531,7 +520,6 @@ fn main() {
             focused: None,
             hover_expand: true,
             hot_corner: 2,
-            corner_armed: false,
             hotkey_toggle: (0x0002 | 0x0004, b'F' as u32),
             hotkey_peek: (0x0002 | 0x0004, b'P' as u32),
             peeking: false,
@@ -610,8 +598,7 @@ fn main() {
         apply_icons_hidden();
         rescan();
 
-        app().hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), hinst, 0);
-        app().kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), hinst, 0);
+        start_hook_thread();
         register_hotkeys();
         SetTimer(main, TIMER_RESCAN, 3000, None);
 
