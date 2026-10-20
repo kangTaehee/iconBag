@@ -23,6 +23,11 @@ static HOOK_FOCUSED: AtomicBool = AtomicBool::new(false);
 static HOOK_BAND: AtomicBool = AtomicBool::new(false);
 static HOOK_CORNER: AtomicU8 = AtomicU8::new(0);
 static HOOK_CORNER_ARMED: AtomicBool = AtomicBool::new(false);
+static HOOK_SEARCH: AtomicU32 = AtomicU32::new(0); // (mods << 16) | vk, 0 = 사용 안 함
+static HOOK_SEARCH_DOWN: AtomicBool = AtomicBool::new(false); // 가로챈 키가 눌린 상태 (자동 반복·KEYUP 처리)
+// 훅이 직접 본 수정키 상태(MOD_* 비트). GetAsyncKeyState 는 훅이 호출되는 시점에 아직 갱신되지 않을 수 있어
+// Win+Space 를 빠르게 누르면 Win 이 안 눌린 것으로 보여 단축키를 놓쳤다.
+static HOOK_MODS: AtomicU32 = AtomicU32::new(0);
 // 더블클릭 판정용 직전 클릭 (훅 스레드 전용)
 static mut LAST_CLICK: (u32, i32, i32) = (0, 0, 0);
 
@@ -43,6 +48,10 @@ pub fn set_hot_corner(c: u8) {
     HOOK_CORNER.store(c, Relaxed);
     HOOK_CORNER_ARMED.store(false, Relaxed);
 }
+pub fn set_search_hotkey(hk: (u32, u32)) {
+    app().hotkey_search = hk;
+    HOOK_SEARCH.store((hk.0 << 16) | (hk.1 & 0xFFFF), Relaxed);
+}
 
 fn hook_main() -> HWND {
     HOOK_MAIN.load(Relaxed) as HWND
@@ -53,6 +62,7 @@ pub unsafe fn start_hook_thread() {
     let a = app();
     HOOK_MAIN.store(a.main as isize, Relaxed);
     HOOK_CORNER.store(a.hot_corner, Relaxed);
+    set_search_hotkey(a.hotkey_search);
     let hinst = a.hinst as isize;
     std::thread::spawn(move || unsafe {
         HOOK_THREAD.store(GetCurrentThreadId(), Relaxed);
@@ -153,6 +163,12 @@ pub unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> L
 // Fence 는 explorer 의 자식 창이라 키 입력이 우리 스레드로 오지 않는다.
 // 바탕화면이 전경일 때만 선택된 Fence 를 대상으로 키를 가로챈다.
 pub unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 {
+        track_modifier(&*(lp as *const KBDLLHOOKSTRUCT), wp as u32);
+    }
+    if code >= 0 && search_hotkey_hit(&*(lp as *const KBDLLHOOKSTRUCT), wp as u32) {
+        return 1;
+    }
     if code >= 0 && (wp as u32 == WM_KEYDOWN || wp as u32 == WM_SYSKEYDOWN) {
         let kb = &*(lp as *const KBDLLHOOKSTRUCT);
         let vk = kb.vkCode;
@@ -174,6 +190,56 @@ pub unsafe extern "system" fn keyboard_hook(code: i32, wp: WPARAM, lp: LPARAM) -
         }
     }
     CallNextHookEx(null_mut(), code, wp, lp)
+}
+
+// 수정키 눌림/뗌을 훅에서 직접 기록한다
+unsafe fn track_modifier(kb: &KBDLLHOOKSTRUCT, msg: u32) {
+    let bit = match kb.vkCode as u16 {
+        VK_LWIN | VK_RWIN => MOD_WIN,
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => MOD_CONTROL,
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => MOD_SHIFT,
+        VK_MENU | VK_LMENU | VK_RMENU => MOD_ALT,
+        _ => return,
+    };
+    let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    if pressed {
+        HOOK_MODS.fetch_or(bit, Relaxed);
+    } else {
+        // 뗌은 무조건 지운다(좌우 짝이 아직 눌려 있으면 GetAsyncKeyState 가 잡는다). 뗌 시점에 비동기 상태를
+        // 읽어 판단하면 같은 지연 때문에 비트가 눌린 채 남아 평범한 Space 가 단축키로 오인될 수 있다.
+        HOOK_MODS.fetch_and(!bit, Relaxed);
+    }
+}
+
+// 검색 단축키(기본 Win+Space). Win+Space 는 시스템(입력 언어 전환)이 쓰는 조합이라 RegisterHotKey 대신
+// 훅에서 가로채고 삼킨다(true). 눌림·자동 반복·뗌을 모두 삼켜야 시스템 동작이 끼어들지 않는다.
+unsafe fn search_hotkey_hit(kb: &KBDLLHOOKSTRUCT, msg: u32) -> bool {
+    let hk = HOOK_SEARCH.load(Relaxed);
+    if hk == 0 || kb.vkCode != hk & 0xFFFF {
+        return false;
+    }
+    if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+        return HOOK_SEARCH_DOWN.swap(false, Relaxed);
+    }
+    let down = |vk: VIRTUAL_KEY| GetAsyncKeyState(vk as i32) < 0;
+    let async_mods = (down(VK_MENU) as u32 * MOD_ALT)
+        | (down(VK_CONTROL) as u32 * MOD_CONTROL)
+        | (down(VK_SHIFT) as u32 * MOD_SHIFT)
+        | ((down(VK_LWIN) || down(VK_RWIN)) as u32 * MOD_WIN);
+    // 훅이 본 상태와 비동기 키 상태를 합친다(훅 설치 전부터 눌려 있던 키는 비동기 상태로만 보인다)
+    let mods = async_mods | HOOK_MODS.load(Relaxed);
+    if mods != hk >> 16 {
+        return false;
+    }
+    if !HOOK_SEARCH_DOWN.swap(true, Relaxed) {
+        PostMessageW(hook_main(), WM_SEARCH, 0, 0);
+        // Win/Alt 만 눌렀다 뗀 것으로 보이면 시작 메뉴·메뉴 막대가 열리므로 할당 안 된 키(0xE8)를 끼워 넣는다
+        if mods & (MOD_WIN | MOD_ALT) != 0 {
+            keybd_event(0xE8, 0, 0, 0);
+            keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+        }
+    }
+    true
 }
 
 // WM_KEY 처리 (메인 창에서 호출)

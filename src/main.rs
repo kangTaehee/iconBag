@@ -8,6 +8,7 @@ mod fence;
 mod input;
 mod peek;
 mod portal;
+mod search;
 mod snapshot;
 mod util;
 pub use config::*;
@@ -16,6 +17,7 @@ pub use fence::*;
 pub use input::*;
 pub use peek::*;
 pub use portal::*;
+pub use search::*;
 pub use snapshot::*;
 pub use util::*;
 
@@ -36,6 +38,7 @@ pub const CLASS_FENCE: &str = "IconDocsFence";
 pub const CLASS_MAIN: &str = "IconDocsMain";
 pub const CLASS_RENAME: &str = "IconDocsRename";
 pub const CLASS_BAND: &str = "IconDocsBand";
+pub const CLASS_SEARCH: &str = "IconDocsSearch";
 pub const NEW_ITEMS_TITLE: &str = "새 항목";
 
 pub const TITLE_H: i32 = 30;
@@ -56,12 +59,15 @@ pub const WM_BAND_UP: u32 = WM_APP + 6;
 pub const WM_PEEK_CLICK: u32 = WM_APP + 7;
 pub const WM_HOTCORNER: u32 = WM_APP + 8;
 pub const WM_KEY: u32 = WM_APP + 9;
+pub const WM_SEARCH: u32 = WM_APP + 10; // 훅 스레드: 검색 단축키
 pub const XBUTTON_BACK: u16 = 0x0001; // XBUTTON1 = 마우스 뒤로 가기 버튼
 pub const TIMER_RESCAN: usize = 1;
 pub const TIMER_HOVER: usize = 2;
 pub const TIMER_TRAYCLICK: usize = 3;
 pub const TIMER_HOTCORNER: usize = 4;
 pub const TIMER_ICONS: usize = 5; // Fence 창: 남은 아이콘 이어서 로드
+pub const TIMER_SEARCH_ACTIVATE: usize = 6; // 검색창: 전경 확보 재시도
+pub const TIMER_SEARCH_CLOSE: usize = 7; // 검색창: 비활성화 뒤 닫기 확인
 pub const ICON_BUDGET_MS: u64 = 12; // 한 번 그릴 때 아이콘 로드에 쓰는 최대 시간
 
 pub const ID_TRAY_NEW: usize = 101;
@@ -75,6 +81,7 @@ pub const ID_TRAY_REAPPLY: usize = 108;
 pub const ID_TRAY_HOVER: usize = 109;
 pub const ID_TRAY_PEEK: usize = 110;
 pub const ID_TRAY_SNAP_SAVE: usize = 111;
+pub const ID_TRAY_SEARCH: usize = 112;
 pub const ID_TRAY_CORNER0: usize = 120; // 120..124
 pub const ID_TRAY_SNAP0: usize = 400; // 복원
 pub const ID_TRAY_SNAPDEL0: usize = 500; // 삭제
@@ -141,6 +148,7 @@ pub struct App {
     pub hot_corner: u8,
     pub hotkey_toggle: (u32, u32),
     pub hotkey_peek: (u32, u32),
+    pub hotkey_search: (u32, u32), // 훅에서 처리 (Win+Space 는 RegisterHotKey 불가)
     pub peeking: bool,
     pub peek_was_hidden: bool,
     pub last_res: (i32, i32),
@@ -168,6 +176,7 @@ unsafe fn tray_menu() {
     menu_sep(menu);
     menu_item(menu, ID_TRAY_PEEK, &format!("피크: 모든 Fence 맨 위로\t{}", hotkey_to_string(a.hotkey_peek)), a.peeking);
     menu_item(menu, ID_TRAY_HIDE, &format!("모든 Fence 숨기기\t{}", hotkey_to_string(a.hotkey_toggle)), a.fences_hidden);
+    menu_item(menu, ID_TRAY_SEARCH, &format!("바탕화면 검색\t{}", hotkey_to_string(a.hotkey_search)), false);
     let sub = CreatePopupMenu();
     for (i, name) in CORNERS.iter().enumerate() {
         menu_item(sub, ID_TRAY_CORNER0 + i, name, a.hot_corner as usize == i);
@@ -216,6 +225,7 @@ unsafe fn tray_menu() {
         ID_TRAY_REAPPLY => reapply_rules(),
         ID_TRAY_PEEK => peek_toggle(),
         ID_TRAY_HIDE => toggle_fences(),
+        ID_TRAY_SEARCH => toggle_search(),
         ID_TRAY_HOVER => {
             a.hover_expand = !a.hover_expand;
             save();
@@ -315,6 +325,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_KEY => {
             handle_key(wp as u32, lp != 0);
+            return 0;
+        }
+        WM_SEARCH => {
+            toggle_search();
             return 0;
         }
         WM_HOTCORNER => {
@@ -522,6 +536,7 @@ fn main() {
             hot_corner: 2,
             hotkey_toggle: (0x0002 | 0x0004, b'F' as u32),
             hotkey_peek: (0x0002 | 0x0004, b'P' as u32),
+            hotkey_search: (0x0008, 0x20), // Win+Space
             peeking: false,
             peek_was_hidden: false,
             last_res: (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
@@ -550,6 +565,7 @@ fn main() {
         register(CLASS_FENCE, Some(fence_proc), CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW, hinst);
         register(CLASS_RENAME, Some(rename_proc), 0, hinst);
         register(CLASS_BAND, Some(band_proc), CS_HREDRAW | CS_VREDRAW, hinst);
+        register(CLASS_SEARCH, Some(search_proc), 0, hinst);
 
         let main = CreateWindowExW(
             0,

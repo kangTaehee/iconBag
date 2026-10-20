@@ -64,6 +64,7 @@ pub fn serialize() -> String {
     s.push_str(&format!("hot_corner={}\n", a.hot_corner));
     s.push_str(&format!("hotkey_toggle={}\n", hotkey_to_string(a.hotkey_toggle)));
     s.push_str(&format!("hotkey_peek={}\n", hotkey_to_string(a.hotkey_peek)));
+    s.push_str(&format!("hotkey_search={}\n", hotkey_to_string(a.hotkey_search)));
     for r in &a.rules {
         s.push_str(&format!("rule={}|{}\n", r.pattern, r.target));
     }
@@ -128,6 +129,11 @@ pub fn parse_into(text: &str) {
             ("hotkey_peek", None) => {
                 if let Some(h) = parse_hotkey(v) {
                     a.hotkey_peek = h;
+                }
+            }
+            ("hotkey_search", None) => {
+                if let Some(h) = parse_hotkey(v) {
+                    set_search_hotkey(h);
                 }
             }
             ("rule", None) => {

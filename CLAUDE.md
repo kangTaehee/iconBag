@@ -16,6 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `src/peek.rs` | 피크(바탕화면 자식 ↔ 최상위 팝업 전환) |
 | `src/portal.rs` | 폴더 포털(폴더 스캔·탐색·드롭 이동·폴더 선택) |
 | `src/snapshot.rs` | 레이아웃 스냅샷 저장/복원, 해상도 변경 대응 |
+| `src/search.rs` | 바탕화면 검색창(Win+Space): 검색 순위(`rank_matches`, 한글 초성 매칭), 팝업 창·입력·실행 |
 | `src/util.rs` | 문자열/색/glob/핫키 파싱 유틸 |
 
 ## 빌드/실행
@@ -34,7 +35,8 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
 - 실행 중인 exe 는 덮어쓸 수 없으므로 다시 빌드하기 전에 앱을 정상 종료해야 한다(아래 WM_CLOSE 참고).
 
 ## 테스트
-- 단위 테스트: `cargo test --release` (단일 테스트는 `cargo test --release <이름 일부>`). `portal.rs` 의 폴더 정렬 비교(`compare_entries`, `SortKey`), `desktop.rs` 의 `is_on_desktop`·`unique_path`·`create_shortcut`(실제 .lnk 생성) 테스트가 있다.
+- 단위 테스트: `cargo test --release` (단일 테스트는 `cargo test --release <이름 일부>`). `portal.rs` 의 폴더 정렬 비교(`compare_entries`, `SortKey`), `desktop.rs` 의 `is_on_desktop`·`unique_path`·`create_shortcut`(실제 .lnk 생성),
+  `search.rs` 의 `rank_matches`, `util.rs` 의 `parse_hotkey`/`hotkey_to_string` 테스트가 있다.
   `util.rs` 의 `glob_match`/`parse_hotkey`, `config.rs` 의 `rule_matches`, `snapshot.rs` 의 `sanitize` 도 순수 함수라 테스트하기 쉽다.
   `parse_into`·`m()` 처럼 전역 `APP` 을 쓰는 함수는 테스트에서 `APP` 을 먼저 초기화해야 한다.
 - 통합 확인은 실제 바탕화면에서 하며, 다음 함정이 있다.
@@ -60,8 +62,9 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
   `delete_fence` 는 뒤 인덱스를 당기므로 `focused` 처럼 인덱스를 들고 있는 상태를 함께 보정해야 한다.
 - **훅 스레드 → 메인 창**: 저수준 훅(`input.rs`)은 `start_hook_thread()` 가 만든 **전용 스레드**에서 돈다. 훅은 `App` 을 읽지 않고
   원자 변수(피크·포커스·밴드 드래그·핫코너)만 읽으며, `WM_APP+n` 메시지(`WM_DESKTOP_DBLCLK`, `WM_BAND_*`, `WM_KEY`,
-  `WM_PEEK_CLICK`, `WM_HOTCORNER`)를 메인 창에 post 한다. 실제 처리는 `main_proc` 에서 한다.
-  그래서 `peeking`·`focused`·`band_start`·`hot_corner` 는 직접 대입하지 말고 `set_peeking`/`set_focused`/`set_band_start`/`set_hot_corner` 로 바꾼다.
+  `WM_PEEK_CLICK`, `WM_HOTCORNER`, `WM_SEARCH`)를 메인 창에 post 한다. 실제 처리는 `main_proc` 에서 한다.
+  그래서 `peeking`·`focused`·`band_start`·`hot_corner`·`hotkey_search` 는 직접 대입하지 말고
+  `set_peeking`/`set_focused`/`set_band_start`/`set_hot_corner`/`set_search_hotkey` 로 바꾼다.
 - **저장**: 상태를 바꾸는 동작은 끝에 `save()` 를 호출해 `layout.txt` 전체를 다시 쓴다. 스냅샷도 같은 `serialize()`/`parse_into()` 를 쓰며,
   `apply_layout` 은 모든 Fence 창을 없애고 다시 만든다.
 - **재검색 루프**: 메인 창 타이머(`TIMER_RESCAN`, 3초)가 `rescan()` 을 부른다. 사라진 파일은 제거하고, 어느 Fence 에도 없는 새 파일은
@@ -96,6 +99,18 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
 - **저수준 훅을 UI 스레드에 두지 말 것**: `WH_MOUSE_LL`/`WH_KEYBOARD_LL` 은 설치한 스레드에서 실행되므로, 그 스레드가 아이콘 로드 등으로 바쁘면
   **시스템 전체** 마우스·키 입력이 밀린다(초기 실행 버벅임의 원인). 훅은 전용 스레드에 두고 UI 상태는 원자 변수로 넘긴다.
   훅 스레드에서는 `GetKeyState` 대신 `GetAsyncKeyState` 를 쓴다(스레드별 키 상태라 값이 틀림).
+- **검색 단축키 Win+Space 는 `RegisterHotKey` 가 아니라 키보드 훅에서 가로챈다**: 시스템(입력 언어 전환)이 쓰는 조합이다.
+  키를 삼킨 뒤 Win 을 떼면 "Win 단독 입력"으로 보여 시작 메뉴가 열리므로, 훅에서 할당 안 된 키(0xE8)를 주입해 막는다.
+  다른 앱이 전경일 때 뜨는 창이라 `SetForegroundWindow` 만으로는 전경 잠금에 걸릴 수 있어 `AttachThreadInput` 으로 넘겨받고,
+  그래도 안 되면 Alt 를 누른 채 다시 시도하고, 전경이 권한 상승 창(작업 관리자 등)이라 키 주입·입력 큐 연결이 UIPI 로 막히면
+  `SwitchToThisWindow` 로 전환한 뒤 타이머로 재시도한다(`activate_search`). 끝내 실패하면 창을 닫는다.
+  전경이 아닌 채 남은 창은 입력을 못 받는 유령이 되고, 다음 단축키가 그 창을 닫는 데 쓰여 "반응 없음"처럼 보이기 때문이다.
+- **훅 안에서 `GetAsyncKeyState` 로 수정키를 읽으면 늦는다**: 훅이 Space 를 볼 때 바로 앞서 눌린 Win 이 아직 반영되지 않아
+  빠르게 누르면 단축키를 놓쳤다. 훅이 본 수정키 눌림/뗌을 `HOOK_MODS` 에 직접 기록해 비동기 상태와 OR 한다.
+  뗌은 무조건 지운다(뗌 시점에 비동기 상태로 판단하면 같은 지연으로 비트가 남아 평범한 Space 가 단축키로 오인된다).
+- **단축키로 띄우는 팝업은 `SW_SHOW` 로 띄우면서 활성화하지 말 것**: 전경 잠금에 막히면 활성→비활성이 연달아 와서
+  "비활성화되면 닫기" 로직이 창을 뜨자마자 닫는다(깜박임). `SW_SHOWNOACTIVATE` 로 띄운 뒤 전경을 따로 확보하고,
+  비활성화 시 닫기는 한 번이라도 전경이 된 뒤에만, 그것도 즉시가 아니라 잠시 뒤 `GetForegroundWindow` 로 재확인해서 닫는다.
 - 마우스 뒤로 가기(XBUTTON1)는 클라이언트에서 `WM_XBUTTONUP`, 제목(HTCAPTION) 위에서 `WM_NCXBUTTONUP` 으로 온다. 처리했으면 TRUE 를 돌려
   `WM_APPCOMMAND` 가 부모(explorer)로 올라가지 않게 한다.
 - 제목 영역은 `WM_NCHITTEST` 가 HTCAPTION 을 돌려주므로 마우스 이동은 `WM_NCMOUSEMOVE` 로 온다(hover 펼치기 처리 시 주의).

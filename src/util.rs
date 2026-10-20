@@ -80,6 +80,7 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
             "shift" => mods |= 0x0004,
             "alt" => mods |= 0x0001,
             "win" => mods |= 0x0008,
+            "space" => vk = 0x20,
             other => {
                 let up = other.to_ascii_uppercase();
                 if up.len() == 1 {
@@ -112,11 +113,37 @@ pub fn hotkey_to_string(hk: (u32, u32)) -> String {
     if hk.0 & 0x0008 != 0 {
         parts.push("Win".to_string());
     }
-    let key = if (0x70..0x88).contains(&hk.1) {
+    let key = if hk.1 == 0x20 {
+        "Space".to_string()
+    } else if (0x70..0x88).contains(&hk.1) {
         format!("F{}", hk.1 - 0x70 + 1)
     } else {
         ((hk.1 as u8) as char).to_string()
     };
     parts.push(key);
     parts.join("+")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_parse_win_space_hotkey() {
+        assert_eq!(parse_hotkey("Win+Space"), Some((0x0008, 0x20)));
+        assert_eq!(parse_hotkey("ctrl + space"), Some((0x0002, 0x20)));
+    }
+
+    #[test]
+    fn should_round_trip_hotkey_through_string() {
+        for s in ["Win+Space", "Ctrl+Shift+F", "Alt+F12"] {
+            assert_eq!(hotkey_to_string(parse_hotkey(s).unwrap()), s);
+        }
+    }
+
+    #[test]
+    fn should_return_none_when_hotkey_has_no_key() {
+        assert_eq!(parse_hotkey("Ctrl+Shift"), None);
+        assert_eq!(parse_hotkey(""), None);
+    }
 }
