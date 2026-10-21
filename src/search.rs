@@ -7,6 +7,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -38,11 +39,17 @@ impl SearchEntry {
         let is_app = matches!(file_ext(Path::new(path)).as_str(), "lnk" | "exe" | "url" | "appref-ms");
         Self::build(item, if is_app { KIND_APP } else { KIND_FILE }, null_mut())
     }
-    // 실행 중인 최상위 창. 아이콘은 창에서 복사해 둔다(Item 이 DestroyIcon 으로 해제하므로 원본을 쓰면 안 된다).
+    // 실행 중인 최상위 창. 이름은 "창 제목 - 프로그램 이름" 이라 프로그램 이름으로도 검색된다.
+    // 아이콘은 창에서 복사해 둔다(Item 이 DestroyIcon 으로 해제하므로 원본을 쓰면 안 된다).
     pub unsafe fn window(hwnd: HWND, title: &str) -> SearchEntry {
+        let exe = process_path(hwnd);
+        let prog = match exe.as_deref() {
+            Some(p) => program_name(p),
+            None => String::new(),
+        };
         let mut item = Item::new("");
-        item.name = title.to_string();
-        item.icon = window_icon(hwnd);
+        item.name = window_display_name(title, &prog);
+        item.icon = window_icon(hwnd, exe.as_deref());
         Self::build(item, KIND_WINDOW, hwnd)
     }
     fn build(item: Item, kind: u8, window: HWND) -> SearchEntry {
@@ -97,7 +104,7 @@ unsafe fn running_windows() -> Vec<SearchEntry> {
 }
 
 // 창 아이콘 복사본. 응답 없는 앱에 막히지 않게 WM_GETICON 은 짧은 시간만 기다리고, 없으면 실행 파일 아이콘을 쓴다.
-unsafe fn window_icon(hwnd: HWND) -> HICON {
+unsafe fn window_icon(hwnd: HWND, exe: Option<&str>) -> HICON {
     let mut h: usize = 0;
     for kind in [ICON_SMALL2, ICON_BIG, ICON_SMALL] {
         SendMessageTimeoutW(hwnd, WM_GETICON, kind as usize, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &mut h);
@@ -114,20 +121,70 @@ unsafe fn window_icon(hwnd: HWND) -> HICON {
     if h != 0 {
         return CopyIcon(h as HICON);
     }
+    exe.map(|p| load_icon(p, 32)).unwrap_or(null_mut())
+}
+
+// 창을 만든 프로세스의 실행 파일 경로
+unsafe fn process_path(hwnd: HWND) -> Option<String> {
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, &mut pid);
     let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
     if proc.is_null() {
-        return null_mut();
+        return None;
     }
     let mut buf = [0u16; 1024];
     let mut len = buf.len() as u32;
     let ok = QueryFullProcessImageNameW(proc, 0, buf.as_mut_ptr(), &mut len);
     CloseHandle(proc);
-    if ok == 0 {
-        return null_mut();
+    (ok != 0).then(|| from_wide(&buf[..len as usize]))
+}
+
+// 프로그램 이름: 실행 파일의 버전 정보 FileDescription("Visual Studio 2022" 등), 없으면 파일 이름(확장자 제외)
+unsafe fn program_name(exe: &str) -> String {
+    file_description(exe).unwrap_or_else(|| {
+        Path::new(exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    })
+}
+
+unsafe fn file_description(exe: &str) -> Option<String> {
+    let p = wide(exe);
+    let mut handle = 0u32;
+    let size = GetFileVersionInfoSizeW(p.as_ptr(), &mut handle);
+    if size == 0 {
+        return None;
     }
-    load_icon(&from_wide(&buf[..len as usize]), 32)
+    let mut data = vec![0u8; size as usize];
+    if GetFileVersionInfoW(p.as_ptr(), 0, size, data.as_mut_ptr() as *mut c_void) == 0 {
+        return None;
+    }
+    // 번역 표(언어·코드 페이지) 첫 항목을 쓰고, 없으면 영어(미국)·유니코드
+    let mut ptr: *mut c_void = null_mut();
+    let mut len = 0u32;
+    let mut lang_cp = (0x0409u16, 0x04B0u16);
+    if VerQueryValueW(data.as_ptr() as *const c_void, wide("\\VarFileInfo\\Translation").as_ptr(), &mut ptr, &mut len) != 0
+        && len >= 4
+    {
+        let t = ptr as *const u16;
+        lang_cp = (*t, *t.add(1));
+    }
+    let key = wide(&format!("\\StringFileInfo\\{:04X}{:04X}\\FileDescription", lang_cp.0, lang_cp.1));
+    if VerQueryValueW(data.as_ptr() as *const c_void, key.as_ptr(), &mut ptr, &mut len) == 0 || len == 0 {
+        return None;
+    }
+    let s = std::slice::from_raw_parts(ptr as *const u16, len as usize);
+    let s = from_wide(&s[..s.iter().position(|&c| c == 0).unwrap_or(s.len())]);
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+// "창 제목 - 프로그램 이름". 프로그램 이름이 없거나 제목이 이미 그 이름으로 끝나면 제목만
+pub fn window_display_name(title: &str, prog: &str) -> String {
+    let title = title.trim();
+    if prog.is_empty() || lower(title).ends_with(&lower(prog)) {
+        title.to_string()
+    } else {
+        format!("{title} - {prog}")
+    }
 }
 
 // 창으로 전환: 최소화돼 있으면 복원. 검색창이 전경인 동안 호출해야 전경 전환이 허용된다.
@@ -207,6 +264,7 @@ struct SearchState {
     entries: Vec<SearchEntry>,
     results: Vec<usize>,
     sel: usize,
+    first: usize, // 화면에 보이는 첫 결과(SEARCH_MAX 행만 보이므로 선택이 밖으로 나가면 민다)
     has_query: bool,
     active: bool, // 한 번이라도 전경이 됐는지. 그 전의 WA_INACTIVE 는 전경 전환 과정의 잡음이라 무시한다
     tries: u8,    // 전경 확보 시도 횟수
@@ -303,12 +361,14 @@ unsafe fn open_search() {
         entries,
         results: Vec::new(),
         sel: 0,
+        first: 0,
         has_query: false,
         active: false,
         tries: 0,
     });
     // SW_SHOW 로 띄우면 활성화를 시도하다 막혔을 때 활성→비활성이 연달아 와서 창이 뜨자마자 닫혔다(깜박임).
     // 활성화 없이 띄운 뒤 전경 확보는 따로 한다.
+    update_results(); // 검색어가 없을 때의 초기 목록(실행 중인 창)
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     activate_search();
 }
@@ -371,12 +431,17 @@ unsafe fn update_results() {
     let mut buf = [0u16; 256];
     let n = GetWindowTextW(s.edit, buf.as_mut_ptr(), buf.len() as i32);
     let q = from_wide(&buf[..n as usize]);
-    s.results = rank_matches(&s.entries, &q);
-    s.results.truncate(SEARCH_MAX);
-    s.sel = 0;
     s.has_query = !q.trim().is_empty();
+    // 검색어가 없으면 실행 중인 창 목록(Z 순서: 방금 쓰던 창이 먼저)을 보여 방향키로 고를 수 있게 한다
+    s.results = if s.has_query {
+        rank_matches(&s.entries, &q)
+    } else {
+        s.entries.iter().enumerate().filter(|(_, e)| e.is_window()).map(|(i, _)| i).collect()
+    };
+    s.sel = 0;
+    s.first = 0;
     // 결과가 없으면 "결과 없음" 한 줄
-    let rows = if s.results.is_empty() { s.has_query as i32 } else { s.results.len() as i32 };
+    let rows = if s.results.is_empty() { s.has_query as i32 } else { s.results.len().min(SEARCH_MAX) as i32 };
     let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
     GetWindowRect(s.hwnd, &mut r);
     let h = m(SEARCH_TOP_H) + rows * m(SEARCH_ROW_H) + if rows > 0 { m(8) } else { 0 };
@@ -391,6 +456,12 @@ unsafe fn move_selection(delta: i32) {
     }
     let n = s.results.len() as i32;
     s.sel = (s.sel as i32 + delta).rem_euclid(n) as usize;
+    // 선택이 보이는 범위를 벗어나면 그쪽으로 민다
+    if s.sel < s.first {
+        s.first = s.sel;
+    } else if s.sel >= s.first + SEARCH_MAX {
+        s.first = s.sel + 1 - SEARCH_MAX;
+    }
     InvalidateRect(s.hwnd, null(), 0);
 }
 
@@ -415,8 +486,8 @@ unsafe fn row_at(y: i32) -> Option<usize> {
     if y < top {
         return None;
     }
-    let r = ((y - top) / m(SEARCH_ROW_H)) as usize;
-    (r < s.results.len()).then_some(r)
+    let r = s.first + ((y - top) / m(SEARCH_ROW_H)) as usize;
+    (r < s.results.len() && r < s.first + SEARCH_MAX).then_some(r)
 }
 
 unsafe fn paint_search(hwnd: HWND) {
@@ -433,7 +504,7 @@ unsafe fn paint_search(hwnd: HWND) {
     DeleteObject(bg as HGDIOBJ);
     if let Some(s) = SEARCH.as_mut() {
         let top = m(SEARCH_TOP_H) - 2;
-        if s.has_query {
+        if s.has_query || !s.results.is_empty() {
             let line = CreateSolidBrush(0xE5E5E5);
             FillRect(mem, &RECT { left: 0, top, right: w, bottom: top + 1 }, line);
             DeleteObject(line as HGDIOBJ);
@@ -442,8 +513,9 @@ unsafe fn paint_search(hwnd: HWND) {
         SetBkMode(mem, TRANSPARENT as i32);
         let icon = m(24);
         let row_top = |r: i32| top + m(4) + r * m(SEARCH_ROW_H);
-        for (r, &ei) in s.results.iter().enumerate() {
-            let y = row_top(r as i32);
+        let first = s.first;
+        for (r, &ei) in s.results.iter().enumerate().skip(first).take(SEARCH_MAX) {
+            let y = row_top((r - first) as i32);
             if r == s.sel {
                 let br = CreateSolidBrush(0xF7E8D9); // 연한 파랑 (BGR)
                 FillRect(mem, &RECT { left: m(4), top: y, right: w - m(4), bottom: y + m(SEARCH_ROW_H) }, br);
@@ -621,6 +693,31 @@ mod tests {
     fn should_put_apps_before_files_when_scores_tie() {
         let es = entries(&[r"C:\d\report.txt", r"C:\d\report.lnk"]);
         assert_eq!(ranked(&es, "report"), ["report", "report.txt"]);
+    }
+
+    #[test]
+    fn should_append_program_name_unless_title_already_ends_with_it() {
+        assert_eq!(window_display_name("작업장", "Visual Studio"), "작업장 - Visual Studio");
+        assert_eq!(window_display_name("문서 - Microsoft Word", "Microsoft Word"), "문서 - Microsoft Word");
+        assert_eq!(window_display_name("  제목  ", ""), "제목");
+    }
+
+    #[test]
+    fn should_read_program_name_from_version_info_of_real_exe() {
+        let exe = format!("{}\\explorer.exe", std::env::var("SystemRoot").unwrap());
+        let name = unsafe { program_name(&exe) };
+        assert!(!name.is_empty() && name != "explorer", "FileDescription 을 읽어야 한다: {name}");
+        assert_eq!(unsafe { program_name(r"C:\없는폴더\없는파일.exe") }, "없는파일");
+    }
+
+    #[test]
+    fn should_find_window_by_program_name() {
+        let mut win = Item::new("");
+        win.name = window_display_name("작업장", "Visual Studio");
+        let es = vec![SearchEntry::build(win, KIND_WINDOW, 1 as HWND)];
+        assert_eq!(ranked(&es, "visual"), ["작업장 - Visual Studio"]);
+        assert_eq!(ranked(&es, "ㅈㅇㅈ"), ["작업장 - Visual Studio"]);
+        assert!(ranked(&es, "word").is_empty());
     }
 
     #[test]
