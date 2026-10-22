@@ -174,9 +174,9 @@ unsafe fn tray_menu() {
     menu_item(menu, ID_TRAY_RESORT, "바탕화면 자동 정리 (폴더/프로그램/문서)", false);
     menu_item(menu, ID_TRAY_REAPPLY, "자동 분류 규칙 다시 적용", false);
     menu_sep(menu);
-    menu_item(menu, ID_TRAY_PEEK, &format!("피크: 모든 Fence 맨 위로\t{}", hotkey_to_string(a.hotkey_peek)), a.peeking);
-    menu_item(menu, ID_TRAY_HIDE, &format!("모든 Fence 숨기기\t{}", hotkey_to_string(a.hotkey_toggle)), a.fences_hidden);
-    menu_item(menu, ID_TRAY_SEARCH, &format!("바탕화면 검색\t{}", hotkey_to_string(a.hotkey_search)), false);
+    menu_item(menu, ID_TRAY_PEEK, &format!("피크: 모든 Fence 맨 위로{}", menu_hotkey(a.hotkey_peek)), a.peeking);
+    menu_item(menu, ID_TRAY_HIDE, &format!("모든 Fence 숨기기{}", menu_hotkey(a.hotkey_toggle)), a.fences_hidden);
+    menu_item(menu, ID_TRAY_SEARCH, &format!("바탕화면 검색{}", menu_hotkey(a.hotkey_search)), false);
     let sub = CreatePopupMenu();
     for (i, name) in CORNERS.iter().enumerate() {
         menu_item(sub, ID_TRAY_CORNER0 + i, name, a.hot_corner as usize == i);

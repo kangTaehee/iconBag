@@ -71,7 +71,11 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 // "ctrl+shift+F" → (MOD_*, vk). 실패하면 None.
+// "none"/"off" 은 단축키 없음((0, 0)). 빈 문자열이나 키가 없는 조합은 None(잘못된 값).
 pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
+    if matches!(s.trim().to_ascii_lowercase().as_str(), "none" | "off" | "없음") {
+        return Some((0, 0));
+    }
     let mut mods = 0u32;
     let mut vk = 0u32;
     for tok in s.split('+').map(|t| t.trim()).filter(|t| !t.is_empty()) {
@@ -100,6 +104,9 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     }
 }
 pub fn hotkey_to_string(hk: (u32, u32)) -> String {
+    if hk.1 == 0 {
+        return "none".to_string();
+    }
     let mut parts = Vec::new();
     if hk.0 & 0x0002 != 0 {
         parts.push("Ctrl".to_string());
@@ -144,6 +151,18 @@ mod tests {
     #[test]
     fn should_return_none_when_hotkey_has_no_key() {
         assert_eq!(parse_hotkey("Ctrl+Shift"), None);
+        assert_eq!(parse_hotkey("none"), Some((0, 0)));
+        assert_eq!(parse_hotkey(" OFF "), Some((0, 0)));
+        assert_eq!(hotkey_to_string((0, 0)), "none");
         assert_eq!(parse_hotkey(""), None);
+    }
+}
+
+// 트레이 메뉴 항목 뒤에 붙일 단축키 표시("\t조합"). 단축키가 없으면 빈 문자열.
+pub fn menu_hotkey(hk: (u32, u32)) -> String {
+    if hk.1 == 0 {
+        String::new()
+    } else {
+        format!("\t{}", hotkey_to_string(hk))
     }
 }

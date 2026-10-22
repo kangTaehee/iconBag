@@ -20,7 +20,7 @@ Stardock Fences 느낌의 가벼운 바탕화면 아이콘 정리 앱 (Windows �
 
 ### 피크 / 핫키 / 레이아웃
 - **피크**: 다른 창 위로 모든 Fence 를 즉시 끌어올림. 트레이 아이콘 클릭, 핫코너(기본 오른쪽 위), 또는 `Ctrl+Shift+P`. Esc 나 바깥 클릭으로 종료
-- `Ctrl+Shift+F` 모든 Fence 숨김/표시 (단축키는 `layout.txt` 의 `hotkey_toggle=`, `hotkey_peek=` 로 변경, 예: `ctrl+alt+F9`)
+- `Ctrl+Shift+F` 모든 Fence 숨김/표시 (단축키는 `layout.txt` 의 `hotkey_toggle=`, `hotkey_peek=` 로 변경, 예: `ctrl+alt+F9`. `none` 이면 단축키 없음)
 - **바탕화면 검색**: `Win+Space`(또는 트레이 메뉴)로 화면 중앙에 검색창. 바탕화면의 앱·바로 가기·파일·폴더를 이름으로 찾고 **Enter 로 첫 항목 실행**.
   ↑/↓ 로 선택, 클릭으로 실행, Esc·바깥 클릭으로 닫기. 여러 단어(`vis code`)와 한글 초성(`ㅋㅋㅇ` → 카카오톡) 검색 지원.
   이름이 검색어로 시작하는 항목 → 단어 시작 → 중간 일치 순이며, 같은 순위면 바로 가기·실행 파일이 먼저.

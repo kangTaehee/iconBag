@@ -88,8 +88,13 @@ pub unsafe fn register_hotkeys() {
     let a = app();
     UnregisterHotKey(a.main, HK_TOGGLE);
     UnregisterHotKey(a.main, HK_PEEK);
-    RegisterHotKey(a.main, HK_TOGGLE, a.hotkey_toggle.0 | MOD_NOREPEAT_FLAG, a.hotkey_toggle.1);
-    RegisterHotKey(a.main, HK_PEEK, a.hotkey_peek.0 | MOD_NOREPEAT_FLAG, a.hotkey_peek.1);
+    // 키가 0 이면 단축키 없음(layout.txt 에 none)
+    if a.hotkey_toggle.1 != 0 {
+        RegisterHotKey(a.main, HK_TOGGLE, a.hotkey_toggle.0 | MOD_NOREPEAT_FLAG, a.hotkey_toggle.1);
+    }
+    if a.hotkey_peek.1 != 0 {
+        RegisterHotKey(a.main, HK_PEEK, a.hotkey_peek.0 | MOD_NOREPEAT_FLAG, a.hotkey_peek.1);
+    }
 }
 
 // 커서가 설정된 핫코너(가상 화면 모서리 3px 이내)에 있는지
