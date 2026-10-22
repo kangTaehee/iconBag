@@ -271,17 +271,43 @@ struct SearchState {
     tries: u8,    // 전경 확보 시도 횟수
     activated_at: u32, // 처음 전경이 된 시각(GetTickCount). 직후의 전경 상실은 닫지 않고 되찾는다
     regrabs: u8,       // 전경을 되찾은 횟수
+    shell_dismissed: bool, // 시작 메뉴·검색 호스트를 Esc 로 닫았는지(열 때마다 한 번만)
 }
 static mut SEARCH: Option<SearchState> = None;
 static mut SEARCH_EDIT_OLD: isize = 0;
-const ACTIVATE_TRIES: u8 = 10;
+const ACTIVATE_TRIES: u8 = 15;
 const ACTIVATE_RETRY_MS: u32 = 40;
 const REGRAB_WINDOW_MS: u32 = 800; // 처음 전경이 된 뒤 이 시간 안의 전경 상실은 되찾는다
 const REGRAB_MAX: u8 = 2;
 
+// 진단 로그: %APPDATA%IconDocssearch.log 파일이 있을 때만 기록한다(전경 전환 문제를 사용자 PC 에서 추적하기 위함)
+unsafe fn slog(msg: &str) {
+    use std::io::Write;
+    let p = config_dir().join("search.log");
+    if !p.exists() {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&p) {
+        let _ = writeln!(f, "{} {}", GetTickCount(), msg);
+    }
+}
+unsafe fn wdesc(h: HWND) -> String {
+    if h.is_null() {
+        return "null".into();
+    }
+    let mut c = [0u16; 64];
+    let n = GetClassNameW(h, c.as_mut_ptr(), 64);
+    let mut t = [0u16; 64];
+    let m = GetWindowTextW(h, t.as_mut_ptr(), 64);
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(h, &mut pid);
+    format!("{:?}[{}|{}|pid {}]", h, from_wide(&c[..n.max(0) as usize]), from_wide(&t[..m.max(0) as usize]), pid)
+}
+
 pub unsafe fn toggle_search() {
     if let Some(s) = SEARCH.as_mut() {
         let hwnd = s.hwnd;
+        slog(&format!("toggle: exists, fg={}", wdesc(GetForegroundWindow())));
         if GetForegroundWindow() == hwnd {
             DestroyWindow(hwnd);
         } else {
@@ -296,6 +322,7 @@ pub unsafe fn toggle_search() {
 
 unsafe fn open_search() {
     let a = app();
+    slog(&format!("open fg={}", wdesc(GetForegroundWindow())));
     let mut entries: Vec<SearchEntry> =
         scan_desktop(&a.desktop_dirs).iter().map(|p| SearchEntry::new(&p.to_string_lossy())).collect();
     entries.extend(running_windows());
@@ -372,6 +399,7 @@ unsafe fn open_search() {
         tries: 0,
         activated_at: 0,
         regrabs: 0,
+        shell_dismissed: false,
     });
     // SW_SHOW 로 띄우면 활성화를 시도하다 막혔을 때 활성→비활성이 연달아 와서 창이 뜨자마자 닫혔다(깜박임).
     // 활성화 없이 띄운 뒤 전경 확보는 따로 한다.
@@ -389,9 +417,23 @@ unsafe fn activate_search() {
     let Some(s) = SEARCH.as_mut() else { return };
     let (hwnd, edit) = (s.hwnd, s.edit);
     KillTimer(hwnd, TIMER_SEARCH_CLOSE);
+    slog(&format!("activate try={} regrabs={} fg={}", s.tries, s.regrabs, wdesc(GetForegroundWindow())));
+    let fg = GetForegroundWindow();
+    if fg != hwnd && !s.shell_dismissed && is_shell_flyout(fg) {
+        // 시작 메뉴(검색 호스트)가 전경이면 셸이 전경을 잠가 아래 방법이 모두 실패한다. Esc 로 먼저 닫고
+        // 전경이 원래 앱으로 돌아온 뒤(약 0.2초) 재시도 타이머에서 가져온다.
+        s.shell_dismissed = true;
+        slog("  shell flyout -> escape");
+        keybd_event(VK_ESCAPE as u8, 0, 0, 0);
+        keybd_event(VK_ESCAPE as u8, 0, KEYEVENTF_KEYUP, 0);
+        s.tries += 1;
+        SetTimer(hwnd, TIMER_SEARCH_ACTIVATE, ACTIVATE_RETRY_MS * 3, None);
+        return;
+    }
     if GetForegroundWindow() != hwnd {
         SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         force_foreground(hwnd);
+        slog(&format!("  after attach fg={}", wdesc(GetForegroundWindow())));
         if GetForegroundWindow() != hwnd {
             // Alt 를 누른 동안 전경을 바꾸면 잠금이 풀린다. 전경이 우리 창으로 바뀐 뒤 Alt 를 떼므로
             // 원래 전경 앱의 메뉴 막대가 열리지 않는다.
@@ -399,11 +441,13 @@ unsafe fn activate_search() {
             force_foreground(hwnd);
             keybd_event(VK_MENU as u8, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
         }
+        slog(&format!("  after alt fg={}", wdesc(GetForegroundWindow())));
         if GetForegroundWindow() != hwnd {
             // 전경이 권한 상승 창(작업 관리자 등)이면 UIPI 때문에 키 주입과 입력 큐 연결이 모두 막힌다.
             // Alt+Tab 이 쓰는 전환은 그 경우에도 동작한다.
             SwitchToThisWindow(hwnd, 1);
         }
+        slog(&format!("  after switch fg={}", wdesc(GetForegroundWindow())));
     }
     if GetForegroundWindow() == hwnd {
         s.active = true;
@@ -417,8 +461,24 @@ unsafe fn activate_search() {
         s.tries += 1;
         SetTimer(hwnd, TIMER_SEARCH_ACTIVATE, ACTIVATE_RETRY_MS, None);
     } else {
+        slog("  give up -> destroy");
         DestroyWindow(hwnd);
     }
+}
+
+// 시작 메뉴·검색 플라이아웃(StartMenuExperienceHost/SearchHost 의 CoreWindow)인지
+unsafe fn is_shell_flyout(h: HWND) -> bool {
+    if h.is_null() {
+        return false;
+    }
+    let mut c = [0u16; 64];
+    let n = GetClassNameW(h, c.as_mut_ptr(), 64);
+    if from_wide(&c[..n.max(0) as usize]) != "Windows.UI.Core.CoreWindow" {
+        return false;
+    }
+    let exe = process_path(h).unwrap_or_default();
+    let stem = Path::new(&exe).file_stem().map(|s| lower(&s.to_string_lossy())).unwrap_or_default();
+    matches!(stem.as_str(), "searchhost" | "startmenuexperiencehost")
 }
 
 unsafe fn force_foreground(hwnd: HWND) {
@@ -478,6 +538,7 @@ unsafe fn move_selection(delta: i32) {
 // 선택 항목(기본 첫 번째) 실행 후 검색창 닫기
 unsafe fn run_selected() {
     let Some(s) = SEARCH.as_ref() else { return };
+    slog("run_selected");
     let Some(&i) = s.results.get(s.sel) else { return };
     let e = &s.entries[i];
     let (hwnd, target, path) = (s.hwnd, e.window, e.item.path.clone());
@@ -595,6 +656,7 @@ pub unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
         // 연달아 오면 창이 깜박이며 사라졌다).
         WM_ACTIVATE => {
             let s = SEARCH.as_mut();
+            slog(&format!("WM_ACTIVATE wp={:#x} other={} active={:?}", wp, wdesc(lp as HWND), SEARCH.as_ref().map(|s| s.active)));
             if (wp & 0xFFFF) as u32 == WA_INACTIVE {
                 if s.is_some_and(|s| s.active) {
                     SetTimer(hwnd, TIMER_SEARCH_CLOSE, 80, None);
@@ -624,6 +686,7 @@ pub unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             }
             TIMER_SEARCH_CLOSE => {
                 KillTimer(hwnd, TIMER_SEARCH_CLOSE);
+                slog(&format!("close-timer fg={}", wdesc(GetForegroundWindow())));
                 if GetForegroundWindow() != hwnd {
                     // 열린 직후의 전경 상실은 사용자가 아니라 전환 과정의 잡음이다(시작 메뉴 닫힘, SwitchToThisWindow 가 띄우는
                     // Alt+Tab 전환기 등). 그 경우 닫지 않고 전경을 되찾는다.
@@ -632,9 +695,11 @@ pub unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                     });
                     if let Some(s) = regrab {
                         s.regrabs += 1;
+                        slog("  regrab");
                         s.tries = 0;
                         activate_search();
                     } else {
+                        slog("  close -> destroy");
                         DestroyWindow(hwnd);
                     }
                 }
@@ -644,6 +709,7 @@ pub unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
         },
         WM_DESTROY => {
             if SEARCH.as_ref().is_some_and(|s| s.hwnd == hwnd) {
+                slog("WM_DESTROY");
                 if let Some(s) = SEARCH.take() {
                     DeleteObject(s.font as HGDIOBJ);
                 }
@@ -663,6 +729,7 @@ unsafe extern "system" fn search_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
                 return 0;
             }
             VK_ESCAPE => {
+                slog("escape");
                 DestroyWindow(GetParent(hwnd));
                 return 0;
             }
