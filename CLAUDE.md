@@ -111,6 +111,8 @@ cargo clippy --release          # 린트 (main.rs 에서 일부 lint 를 crate �
 - **단축키로 띄우는 팝업은 `SW_SHOW` 로 띄우면서 활성화하지 말 것**: 전경 잠금에 막히면 활성→비활성이 연달아 와서
   "비활성화되면 닫기" 로직이 창을 뜨자마자 닫는다(깜박임). `SW_SHOWNOACTIVATE` 로 띄운 뒤 전경을 따로 확보하고,
   비활성화 시 닫기는 한 번이라도 전경이 된 뒤에만, 그것도 즉시가 아니라 잠시 뒤 `GetForegroundWindow` 로 재확인해서 닫는다.
+  처음 전경이 된 뒤 `REGRAB_WINDOW_MS`(0.8초) 안에 전경을 잃으면 사용자가 아니라 전환 과정의 잡음(시작 메뉴 닫힘, 전환기 창 등)이므로
+  닫지 않고 `activate_search` 로 되찾는다(최대 `REGRAB_MAX` 회). 시작 메뉴가 떠 있을 때 Win+Space 로 열린 창이 바로 꺼지던 원인이다.
 - 마우스 뒤로 가기(XBUTTON1)는 클라이언트에서 `WM_XBUTTONUP`, 제목(HTCAPTION) 위에서 `WM_NCXBUTTONUP` 으로 온다. 처리했으면 TRUE 를 돌려
   `WM_APPCOMMAND` 가 부모(explorer)로 올라가지 않게 한다.
 - 제목 영역은 `WM_NCHITTEST` 가 HTCAPTION 을 돌려주므로 마우스 이동은 `WM_NCMOUSEMOVE` 로 온다(hover 펼치기 처리 시 주의).

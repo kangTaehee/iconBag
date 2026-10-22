@@ -9,6 +9,7 @@ use windows_sys::Win32::Graphics::Dwm::DwmGetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -268,11 +269,15 @@ struct SearchState {
     has_query: bool,
     active: bool, // 한 번이라도 전경이 됐는지. 그 전의 WA_INACTIVE 는 전경 전환 과정의 잡음이라 무시한다
     tries: u8,    // 전경 확보 시도 횟수
+    activated_at: u32, // 처음 전경이 된 시각(GetTickCount). 직후의 전경 상실은 닫지 않고 되찾는다
+    regrabs: u8,       // 전경을 되찾은 횟수
 }
 static mut SEARCH: Option<SearchState> = None;
 static mut SEARCH_EDIT_OLD: isize = 0;
 const ACTIVATE_TRIES: u8 = 10;
 const ACTIVATE_RETRY_MS: u32 = 40;
+const REGRAB_WINDOW_MS: u32 = 800; // 처음 전경이 된 뒤 이 시간 안의 전경 상실은 되찾는다
+const REGRAB_MAX: u8 = 2;
 
 pub unsafe fn toggle_search() {
     if let Some(s) = SEARCH.as_mut() {
@@ -365,6 +370,8 @@ unsafe fn open_search() {
         has_query: false,
         active: false,
         tries: 0,
+        activated_at: 0,
+        regrabs: 0,
     });
     // SW_SHOW 로 띄우면 활성화를 시도하다 막혔을 때 활성→비활성이 연달아 와서 창이 뜨자마자 닫혔다(깜박임).
     // 활성화 없이 띄운 뒤 전경 확보는 따로 한다.
@@ -400,6 +407,9 @@ unsafe fn activate_search() {
     }
     if GetForegroundWindow() == hwnd {
         s.active = true;
+        if s.activated_at == 0 {
+            s.activated_at = GetTickCount();
+        }
         s.tries = 0;
         KillTimer(hwnd, TIMER_SEARCH_ACTIVATE);
         SetFocus(edit);
@@ -593,6 +603,9 @@ pub unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
                 KillTimer(hwnd, TIMER_SEARCH_CLOSE);
                 if let Some(s) = s {
                     s.active = true;
+                    if s.activated_at == 0 {
+                        s.activated_at = GetTickCount();
+                    }
                     SetFocus(s.edit);
                 }
             }
@@ -612,7 +625,18 @@ pub unsafe extern "system" fn search_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             TIMER_SEARCH_CLOSE => {
                 KillTimer(hwnd, TIMER_SEARCH_CLOSE);
                 if GetForegroundWindow() != hwnd {
-                    DestroyWindow(hwnd);
+                    // 열린 직후의 전경 상실은 사용자가 아니라 전환 과정의 잡음이다(시작 메뉴 닫힘, SwitchToThisWindow 가 띄우는
+                    // Alt+Tab 전환기 등). 그 경우 닫지 않고 전경을 되찾는다.
+                    let regrab = SEARCH.as_mut().filter(|s| {
+                        GetTickCount().wrapping_sub(s.activated_at) < REGRAB_WINDOW_MS && s.regrabs < REGRAB_MAX
+                    });
+                    if let Some(s) = regrab {
+                        s.regrabs += 1;
+                        s.tries = 0;
+                        activate_search();
+                    } else {
+                        DestroyWindow(hwnd);
+                    }
                 }
                 return 0;
             }
